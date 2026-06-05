@@ -1,3 +1,5 @@
+#!/usr/bin/python3
+
 """
 Taken from https://github.com/pappuks/1brc/blob/main/py_1brc_final.py.
 All rights reserved to the original authors.
