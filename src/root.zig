@@ -23,7 +23,7 @@ pub fn printStats(
         min: i16,
         max: i16,
         sum: i64,
-        count: u64
+        count: i64 // should never overflow
     };
     
     var hashmap = std.StringHashMap(StationStats).init(allocator);
@@ -94,12 +94,47 @@ pub fn printStats(
         lookup.value_ptr.* = new_value;
     }
 
+    var name_buffer = try allocator.alloc([]const u8, hashmap.count());
+    defer allocator.free(name_buffer);
+    var stats_buffer = try allocator.alloc(StationStats, hashmap.count());
+    defer allocator.free(stats_buffer);
+    
     var iterator = hashmap.iterator();
-    std.debug.print("{{", .{});
+    var curr_index: usize = 0;
     while (iterator.next()) |entry| {
         const name = entry.key_ptr.*;
-        const stats = entry.value_ptr;
-        std.debug.print("{s}={}/{}/{d:.1}, ", .{name, stats.min, stats.max, @as(f64, @floatFromInt(stats.sum)) / @as(f64, @floatFromInt(stats.count))});
+        const stats = entry.value_ptr.*;
+        name_buffer[curr_index] = name;
+        stats_buffer[curr_index] = stats;
+        curr_index += 1;
+    }
+
+    const sort_context: struct {
+        name_buffer: [][]const u8,
+        stats_buffer: []StationStats,
+
+        pub fn swap(self: *const @This(), elem1: usize, elem2: usize) void {
+            std.mem.swap([]const u8, &self.name_buffer[elem1], &self.name_buffer[elem2]);
+            std.mem.swap(StationStats, &self.stats_buffer[elem1], &self.stats_buffer[elem2]);
+        }
+
+        pub fn lessThan(self: *const @This(), elem1: usize, elem2: usize) bool {
+            return std.mem.lessThan(u8, self.name_buffer[elem1], self.name_buffer[elem2]);
+        }
+    } = .{ 
+        .name_buffer = name_buffer,
+        .stats_buffer = stats_buffer,
+    };
+    
+    std.sort.heapContext(0, name_buffer.len, sort_context);
+    std.debug.print("{{", .{});
+    for (name_buffer, 0..) |name, i| {
+        if (i > 0) std.debug.print(",", .{});
+        std.debug.print("\"{s}\"=", .{name});
+        const stats = stats_buffer[i];
+                                            // add to get proper rounding
+        const average = @divTrunc(stats.sum + (stats.count - 1), stats.count);
+        std.debug.print("{d}.{d}/{d}.{d}/{d}.{d}", .{@divTrunc(stats.min, 10), @abs(@rem(stats.min, 10)), @divTrunc(average, 10), @abs(@rem(average, 10)), @divTrunc(stats.max, 10), @abs(@rem(stats.max, 10))});
     }
     std.debug.print("}}\n", .{});
 }
