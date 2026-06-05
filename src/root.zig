@@ -130,7 +130,7 @@ pub fn printStats(
     std.sort.heapContext(0, name_buffer.len, sort_context);
     try writer.print("{{", .{});
     for (name_buffer, 0..) |name, i| {
-        if (i > 0) try writer.print(",", .{});
+        if (i > 0) try writer.print(", ", .{});
         try writer.print("\"{s}\"=", .{name});
         const stats = stats_buffer[i];
                                             // add to get proper rounding
