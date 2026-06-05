@@ -15,7 +15,9 @@ pub fn main(init: std.process.Init) !void {
     _ = args.skip();
     const file_name = args.next() orelse "data/measurements.txt";
 
-    try _1brc.printStats(file_name, allocator, io);
-
-    std.debug.print("Done", .{});
+    var print_buffer: [1024]u8 = undefined;
+    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &print_buffer);
+    const stdout_writer = &stdout_file_writer.interface;
+    
+    try _1brc.printStats(file_name, allocator, io, stdout_writer);
 }

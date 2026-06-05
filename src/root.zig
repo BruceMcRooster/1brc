@@ -9,6 +9,7 @@ pub fn printStats(
     file_name: []const u8,
     allocator: std.mem.Allocator,
     io: Io,
+    writer: *Io.Writer,
 ) !void {
     const file = try Io.Dir.openFile(Io.Dir.cwd(), io, file_name, .{ .mode = .read_only });
     defer file.close(io);
@@ -127,14 +128,15 @@ pub fn printStats(
     };
     
     std.sort.heapContext(0, name_buffer.len, sort_context);
-    std.debug.print("{{", .{});
+    try writer.print("{{", .{});
     for (name_buffer, 0..) |name, i| {
-        if (i > 0) std.debug.print(",", .{});
-        std.debug.print("\"{s}\"=", .{name});
+        if (i > 0) try writer.print(",", .{});
+        try writer.print("\"{s}\"=", .{name});
         const stats = stats_buffer[i];
                                             // add to get proper rounding
         const average = @divTrunc(stats.sum + (stats.count - 1), stats.count);
-        std.debug.print("{d}.{d}/{d}.{d}/{d}.{d}", .{@divTrunc(stats.min, 10), @abs(@rem(stats.min, 10)), @divTrunc(average, 10), @abs(@rem(average, 10)), @divTrunc(stats.max, 10), @abs(@rem(stats.max, 10))});
+        try writer.print("{d}.{d}/{d}.{d}/{d}.{d}", .{@divTrunc(stats.min, 10), @abs(@rem(stats.min, 10)), @divTrunc(average, 10), @abs(@rem(average, 10)), @divTrunc(stats.max, 10), @abs(@rem(stats.max, 10))});
     }
-    std.debug.print("}}\n", .{});
+    try writer.print("}}\n", .{});
+    try writer.flush();
 }
