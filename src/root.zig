@@ -131,7 +131,7 @@ pub fn printStats(
     try writer.print("{{", .{});
     for (name_buffer, 0..) |name, i| {
         if (i > 0) try writer.print(", ", .{});
-        try writer.print("\"{s}\"=", .{name});
+        try writer.print("{s}=", .{name});
         const stats = stats_buffer[i];
                                             // add to get proper rounding
         const average = @divTrunc(stats.sum + (stats.count - 1), stats.count);
