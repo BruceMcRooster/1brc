@@ -31,13 +31,11 @@ pub fn printStats(
     var hashmap = std.StringHashMap(StationStats).init(allocator);
     try hashmap.ensureTotalCapacity(max_unique_station_count * 4); // vibes-based number, will get rounded up to nearest power of 2 internally
     defer hashmap.deinit();
-    defer {
-        var it = hashmap.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-        }
-    }
 
+    const string_buffer = try allocator.alloc(u8, max_station_name_length * max_unique_station_count);
+    defer allocator.free(string_buffer);
+    var string_buffer_allocator = std.heap.FixedBufferAllocator.init(string_buffer);
+    const string_allocator = string_buffer_allocator.allocator();
 
     readloop: while (true) {
         const name = file_reader.interface.takeDelimiterExclusive(';') catch |err| {
@@ -50,7 +48,7 @@ pub fn printStats(
         if (name.len == 0) break;
         const lookup = try hashmap.getOrPut(name);
         if (!lookup.found_existing) {
-            const allocated_name = try allocator.alloc(u8, name.len);
+            const allocated_name = try string_allocator.alloc(u8, name.len);
             _ = @memcpy(allocated_name, name);
             lookup.key_ptr.* = allocated_name;
         }
