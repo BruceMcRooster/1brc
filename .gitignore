@@ -3,3 +3,4 @@ zig-out/
 *.o
 measurements*.txt
 test-run/
+*.trace/

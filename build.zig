@@ -41,6 +41,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    const build_profile_build = b.option(
+        bool, "include-profile", 
+        "Also output a fast build with symbols for profiling"
+    ) orelse false;
+    
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
     // to the module defined above, it's sometimes preferable to split business
@@ -82,6 +87,14 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    
+    if (build_profile_build) {
+        // edit directly so it's never out of sync
+        const profile_exe = exe;
+        profile_exe.root_module.optimize = .ReleaseFast;
+        profile_exe.root_module.strip = false;
+        b.installArtifact(profile_exe);
+    }
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
