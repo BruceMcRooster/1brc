@@ -1,6 +1,7 @@
 //! By convention, root.zig is the root source file when making a package.
 const std = @import("std");
 const Io = std.Io;
+const assert = std.debug.assert;
 
 const max_station_name_length = 100;
 const max_unique_station_count = 10_000;
@@ -38,7 +39,7 @@ pub fn printStats(
     const string_allocator = string_buffer_allocator.allocator();
 
     readloop: while (true) {
-        const name = file_reader.interface.takeDelimiterExclusive(';') catch |err| {
+        const name = file_reader.interface.takeDelimiterInclusive(';') catch |err| {
             if (err == error.EndOfStream) {
                 break :readloop;
             } else {
@@ -46,28 +47,17 @@ pub fn printStats(
             }
         };
         if (name.len == 0) break;
-        const lookup = try hashmap.getOrPut(name);
+        const lookup = try hashmap.getOrPut(name[0..name.len-1]);
         if (!lookup.found_existing) {
-            const allocated_name = try string_allocator.alloc(u8, name.len);
-            _ = @memcpy(allocated_name, name);
+            const allocated_name = try string_allocator.alloc(u8, name.len - 1);
+            _ = @memcpy(allocated_name, name[0..name.len-1]);
             lookup.key_ptr.* = allocated_name;
         }
-        const semicolon = try file_reader.interface.takeByte();
-        std.debug.assert(semicolon == ';');
-        const temp = try file_reader.interface.takeDelimiterExclusive('\n');
+        assert(name[name.len-1] == ';');
+        const temp = try file_reader.interface.takeDelimiterInclusive('\n');
         if (temp.len == 0) break;
-        const value = try std.fmt.parseFloat(f32, temp);
-        // we probably just read past the end (might not have a terminal newline on last byte)
-        var found_end = false;
-        const newline = file_reader.interface.takeByte() catch |err| blk: {
-            if (err == error.EndOfStream) {
-                found_end = true;
-            } else {
-                return err;
-            }
-            break :blk '\n'; // satisfy the assert, and give some value
-        };
-        std.debug.assert(newline == '\n');
+        const found_end = temp[temp.len-1] != '\n';
+        const value = try std.fmt.parseFloat(f32, temp[0..(if (found_end) temp.len else temp.len-1)]);
 
         var new_value: StationStats = undefined;
         if (lookup.found_existing) {
@@ -81,6 +71,9 @@ pub fn printStats(
             new_value = .{ .min = value, .max = value, .sum = value, .count = 1 };
         }
         lookup.value_ptr.* = new_value;
+
+        if (found_end) break; // no need to make another syscall on the next loop,
+                              // we already know we're out of characters because we got a short read (no \n)
     }
 
     var name_buffer = try allocator.alloc([]const u8, hashmap.count());
