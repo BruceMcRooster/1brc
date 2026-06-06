@@ -16,20 +16,14 @@
 package dev.morling.onebrc;
 
 import java.io.BufferedWriter;
-import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
 
-public class CreateMeasurementsFast {
+public class CreateMeasurements {
 
     private static final Path MEASUREMENT_FILE = Path.of("./measurements.txt");
-    static final Executor EXECUTOR_SERVICE = Executors.newWorkStealingPool();
 
     private record WeatherStation(String id, double meanTemperature) {
         double measurement() {
@@ -54,14 +48,6 @@ public class CreateMeasurementsFast {
             System.out.println("Invalid value for <number of records to create>");
             System.out.println("Usage: CreateMeasurements <number of records to create>");
             System.exit(1);
-        }
-
-        try {
-            Files.deleteIfExists(MEASUREMENT_FILE);
-            Files.createFile(MEASUREMENT_FILE);
-        }
-        catch (Exception e) {
-            // ignore
         }
 
         // @formatter:off
@@ -503,35 +489,17 @@ public class CreateMeasurementsFast {
                 new WeatherStation("Zanzibar City", 26.0),
                 new WeatherStation("Zürich", 9.3));
 
-        int chunkSize = (size / 10_000_000) == 0 ? size : 10_000_000;
-        int numberOfFutures = size / chunkSize;
-        if (numberOfFutures == 0) {
-            numberOfFutures = 1;
+        try (BufferedWriter bw = Files.newBufferedWriter(MEASUREMENT_FILE)) {
+            for (int i = 0; i < size; i++) {
+                if (i > 0 && i % 50_000_000 == 0) {
+                    System.out.printf("Wrote %,d measurements in %s ms%n", i, System.currentTimeMillis() - start);
+                }
+                WeatherStation station = stations.get(ThreadLocalRandom.current().nextInt(stations.size()));
+                bw.write(station.id());
+                bw.write(";" + station.measurement());
+                bw.write('\n');
+            }
         }
-        CompletableFuture<?>[] futures = new CompletableFuture[numberOfFutures];
-
-        for (int n = 0; n < numberOfFutures; n++) {
-            int finalN = n;
-            futures[n] = CompletableFuture.runAsync(() -> {
-                StringBuilder builder = new StringBuilder();
-                for (int i = finalN * chunkSize; i <= (finalN + 1) * chunkSize - 1; i++) {
-                    WeatherStation station = stations.get(ThreadLocalRandom.current().nextInt(stations.size()));
-                    builder.append(station.id())
-                            .append(";")
-                            .append(station.measurement())
-                            .append('\n');
-                }
-                try (BufferedWriter bw = Files.newBufferedWriter(MEASUREMENT_FILE, StandardOpenOption.APPEND)) {
-                    bw.write(builder.toString());
-                }
-                catch (IOException e) {
-                    throw new RuntimeException(e);
-                }
-            }, EXECUTOR_SERVICE);
-        }
-
-        CompletableFuture.allOf(futures).join();
-
         System.out.printf("Created file with %,d measurements in %s ms%n", size, System.currentTimeMillis() - start);
     }
 }

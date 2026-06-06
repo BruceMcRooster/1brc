@@ -1,5 +1,5 @@
 .zig-cache/
 zig-out/
 *.o
-measurements.txt
+measurements*.txt
 test-run/
