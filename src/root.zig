@@ -19,12 +19,10 @@ pub fn printStats(
     var file_reader = file.reader(io, &line_buffer);
 
     const StationStats = struct {
-        // since floats only have one decimal place, these just represent them as value * 10
-        // to avoid all floating point math
-        min: i16,
-        max: i16,
-        sum: i64,
-        count: i64 // should never overflow
+        min: f32,
+        max: f32,
+        sum: f64,
+        count: u32
     };
     
     var hashmap = std.StringHashMap(StationStats).init(allocator);
@@ -56,19 +54,7 @@ pub fn printStats(
         std.debug.assert(semicolon == ';');
         const temp = try file_reader.interface.takeDelimiterExclusive('\n');
         if (temp.len == 0) break;
-        const decimal_offset: u8 = blk: {
-            if (temp[1] == '.') {
-                break :blk 1;
-            } else if (temp[2] == '.') {
-                break :blk 2;
-            } else {
-                break :blk 3;
-            }
-        };
-        std.debug.assert(temp[decimal_offset] == '.');
-        const predecimal = try std.fmt.parseInt(i8, temp[0..decimal_offset], 10);
-        const postdecimal = try std.fmt.parseInt(u8, temp[decimal_offset + 1 ..], 10);
-        const value = @as(i16, predecimal) * 10 + postdecimal;
+        const value = try std.fmt.parseFloat(f32, temp);
         // we probably just read past the end (might not have a terminal newline on last byte)
         var found_end = false;
         const newline = file_reader.interface.takeByte() catch |err| blk: {
@@ -133,9 +119,15 @@ pub fn printStats(
         if (i > 0) try writer.print(", ", .{});
         try writer.print("{s}=", .{name});
         const stats = stats_buffer[i];
-                                            // add to get proper rounding
-        const average = @divTrunc(stats.sum + (stats.count - 1), stats.count);
-        try writer.print("{d}.{d}/{d}.{d}/{d}.{d}", .{@divTrunc(stats.min, 10), @abs(@rem(stats.min, 10)), @divTrunc(average, 10), @abs(@rem(average, 10)), @divTrunc(stats.max, 10), @abs(@rem(stats.max, 10))});
+        const average = blk: {
+            const partial_result = @floor(stats.sum * 10 + 0.5) / 10 / @as(f64, stats.count);
+            // apparently this works for Java Math, so it works for me
+            break :blk @floor(partial_result * 10 + 0.5) / 10;
+        };
+        try writer.print(
+            "{d:.1}/{d:.1}/{d:.1}",
+            .{stats.min, average, stats.max}
+        );
     }
     try writer.print("}}\n", .{});
     try writer.flush();
