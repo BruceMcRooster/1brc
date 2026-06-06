@@ -2,6 +2,9 @@
 const std = @import("std");
 const Io = std.Io;
 
+const max_station_name_length = 100;
+const max_unique_station_count = 10_000;
+
 /// Computes and prints the statistics for the given file to stdout,
 /// in the format specified by the challenge
 /// (`{Abha=-23.0/18.0/59.2, Abidjan=-16.2/26.0/67.3, ...}`).
@@ -26,6 +29,7 @@ pub fn printStats(
     };
     
     var hashmap = std.StringHashMap(StationStats).init(allocator);
+    try hashmap.ensureTotalCapacity(max_unique_station_count * 4); // vibes-based number, will get rounded up to nearest power of 2 internally
     defer hashmap.deinit();
     defer {
         var it = hashmap.iterator();
