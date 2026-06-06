@@ -21,7 +21,7 @@ def replace_commas(file_path: Path):
         f.write(updated_content)
 
 with open(ref_file, 'w') as f:
-    subprocess.run(["java", "./src/main/java/dev/morling/onebrc/CreateMeasurementsFast.java"], stdout=f)
+    subprocess.run(["java", "./src/main/java/dev/morling/onebrc/CalculateAverage_baseline.java"], stdout=f)
 
 replace_commas(ref_file)
 
