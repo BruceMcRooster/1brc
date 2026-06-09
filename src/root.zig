@@ -17,10 +17,6 @@ pub fn printStats(
 ) !void {
     const file = try Io.Dir.openFile(Io.Dir.cwd(), io, file_name, .{ .mode = .read_only });
     defer file.close(io);
-    
-    // lines are: <name:100 bytes max>;(-)dd.d\n = 107 bytes max
-    var line_buffer: [107]u8 = undefined;
-    var file_reader = file.reader(io, &line_buffer);
 
     const StationStats = struct {
         min: f32,
@@ -37,6 +33,12 @@ pub fn printStats(
     defer allocator.free(string_buffer);
     var string_buffer_allocator = std.heap.FixedBufferAllocator.init(string_buffer);
     const string_allocator = string_buffer_allocator.allocator();
+
+    // align to vector reads (64 bytes)
+    const read_buffer = try allocator.alignedAlloc(u8, .@"64", 1024 * 1024);
+    defer allocator.free(read_buffer);
+
+    var file_reader = file.reader(io, read_buffer);
 
     readloop: while (true) {
         const name = file_reader.interface.takeDelimiterInclusive(';') catch |err| {
