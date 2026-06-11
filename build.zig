@@ -89,10 +89,18 @@ pub fn build(b: *std.Build) void {
     });
     
     if (build_profile_build) {
-        // edit directly so it's never out of sync
-        const profile_exe = exe;
-        profile_exe.root_module.optimize = .ReleaseFast;
-        profile_exe.root_module.strip = false;
+        const profile_exe = b.addExecutable(.{
+            .name = "_1brc_profile",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/main.zig"),
+                .target = target,
+                .optimize = .ReleaseFast,
+                .imports = &.{
+                    .{ .name = "_1brc", .module = mod },
+                },
+                .strip = false, // don't strip debug symbols
+            })
+        });
         b.installArtifact(profile_exe);
     }
 
