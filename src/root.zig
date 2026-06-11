@@ -40,42 +40,108 @@ pub fn printStats(
 
     var file_reader = file.reader(io, read_buffer);
 
+    var separator_bitmask_curr: u128 = 0;
+    var state: union(enum) {
+        reading_name: void,
+        reading_value: struct {
+            stats: *StationStats,
+            // whether we should just updated the stats
+            // instead of overwriting them with our new values (because there were no stats)
+            do_update: bool
+        }
+    } = .reading_name;
+
     readloop: while (true) {
-        const name = file_reader.interface.takeDelimiterInclusive(';') catch |err| {
-            if (err == error.EndOfStream) {
-                break :readloop;
+        const buffer_curr: []u8 = get_buff: {
+            if (separator_bitmask_curr != 0) {
+                const buffer_start = file_reader.interface.seek;
+                const buffer_end = blk: {
+                    const separator_bitmask_start = buffer_start & ~@as(usize, 127); // round down to nearest multiple of 128
+                    const next_offset: usize = @ctz(separator_bitmask_curr);
+                    assert(next_offset < 128); // not at the end, because we know it wasn't zero
+                    break :blk separator_bitmask_start + next_offset;
+                };
+                separator_bitmask_curr ^= @as(u128, 1) << @intCast(@ctz(separator_bitmask_curr));
+                const new_buff = read_buffer[buffer_start..buffer_end];
+                file_reader.interface.toss(new_buff.len + 1); // add one for separator
+                break :get_buff new_buff;
             } else {
-                return err;
+                // the size required to be loaded so we can safely read the next vector.
+                // because when asking for this sizing to be available with fill,
+                // we may be rebased to the beginning, we may not end up reading all of it,
+                // but this is what is required if that is not the case
+                const required_size_next: usize = blk: {
+                    const up_to_next_128_multiple = ((file_reader.interface.seek + 127) & ~@as(usize, 127)) - file_reader.interface.seek;
+                    break :blk 128 + up_to_next_128_multiple;
+                };
+                if (file_reader.interface.fill(required_size_next)) {
+                    // have to reread here, because it may have changed due to rebase in fill
+                    const buffer_start = file_reader.interface.seek;
+                    
+                    const next_vec_start = (file_reader.interface.seek + 127) & ~@as(usize, 127);
+                    separator_bitmask_curr = blk: {
+                        const array: *align(64) [128]u8 = @ptrCast(@alignCast(read_buffer[next_vec_start..][0..128]));
+                        const vec: @Vector(128, u8) = array.*;
+                        const separators = (vec == @as(@Vector(128, u8), @splat(';'))) | (vec == @as(@Vector(128, u8), @splat('\n')));
+                        break :blk @bitCast(separators);
+                    };
+                    const in_vec_separator_offset: usize = @ctz(separator_bitmask_curr);
+                    separator_bitmask_curr ^= @as(u128, 1) << @intCast(in_vec_separator_offset);
+                    const buffer_end = next_vec_start + in_vec_separator_offset;
+
+                    const new_buff = read_buffer[buffer_start..buffer_end];
+                    file_reader.interface.toss(new_buff.len + 1); // +1 for separator
+                    break :get_buff new_buff;
+                } else |err| {
+                    if (err == error.ReadFailed) {
+                        @branchHint(.cold);
+                        return err;
+                    }
+                    // EndOfStream indicates we cannot make another full vectorized read
+                    // so we must instead use simpler techniques
+                    switch (state) {
+                        .reading_name => {
+                            // returns null if at the end of the stream (0 bytes remain), which signals we're done reading
+                            break :get_buff try file_reader.interface.takeDelimiter(';') orelse break :readloop;
+                        },
+                        .reading_value => {
+                            // probably won't ever return null (out of bytes) since generated files have final newlines
+                            // (it will fail the next time around while reading name),
+                            // but just in case, it's handled
+                            break :get_buff try file_reader.interface.takeDelimiter('\n') orelse break :readloop;
+                        }
+                    }
+                }
             }
-        };
-        if (name.len == 0) break;
-        const lookup = try hashmap.getOrPut(name[0..name.len-1]);
-        if (!lookup.found_existing) {
-            const allocated_name = try string_allocator.alloc(u8, name.len - 1);
-            _ = @memcpy(allocated_name, name[0..name.len-1]);
-            lookup.key_ptr.* = allocated_name;
-        }
-        assert(name[name.len-1] == ';');
-        const temp = try file_reader.interface.takeDelimiterInclusive('\n');
-        if (temp.len == 0) break;
-        const found_end = temp[temp.len-1] != '\n';
-        const value = try std.fmt.parseFloat(f32, temp[0..(if (found_end) temp.len else temp.len-1)]);
+        }; // buffer_curr
+        switch (state) {
+            .reading_name => {
+                const lookup = try hashmap.getOrPut(buffer_curr);
+                if (!lookup.found_existing) {
+                    const allocated_name = try string_allocator.alloc(u8, buffer_curr.len);
+                    _ = @memcpy(allocated_name, buffer_curr);
+                    lookup.key_ptr.* = allocated_name;
+                }
+                state = .{ .reading_value = .{ .do_update = lookup.found_existing, .stats = lookup.value_ptr } };
+            },
+            .reading_value => |value_state| {
+                const value = try std.fmt.parseFloat(f32, buffer_curr);
+                var new_value: StationStats = undefined;
+                if (value_state.do_update) {
+                    new_value = .{
+                        .min = @min(value_state.stats.min, value),
+                        .max = @max(value_state.stats.max, value),
+                        .sum = value_state.stats.sum + value,
+                        .count = value_state.stats.count + 1,
+                    };
+                } else {
+                    new_value = .{ .min = value, .max = value, .sum = value, .count = 1 };
+                }
+                value_state.stats.* = new_value;
 
-        var new_value: StationStats = undefined;
-        if (lookup.found_existing) {
-            new_value = .{
-                .min = @min(lookup.value_ptr.min, value),
-                .max = @max(lookup.value_ptr.max, value),
-                .sum = lookup.value_ptr.sum + value,
-                .count = lookup.value_ptr.count + 1,
-            };
-        } else {
-            new_value = .{ .min = value, .max = value, .sum = value, .count = 1 };
+                state = .reading_name;
+            }
         }
-        lookup.value_ptr.* = new_value;
-
-        if (found_end) break; // no need to make another syscall on the next loop,
-                              // we already know we're out of characters because we got a short read (no \n)
     }
 
     var name_buffer = try allocator.alloc([]const u8, hashmap.count());
