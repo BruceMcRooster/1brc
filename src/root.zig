@@ -19,9 +19,9 @@ pub fn printStats(
     defer file.close(io);
 
     const StationStats = struct {
-        min: f32,
-        max: f32,
-        sum: f64,
+        min: i16,
+        max: i16,
+        sum: i64,
         count: u32
     };
     
@@ -35,10 +35,11 @@ pub fn printStats(
     const string_allocator = string_buffer_allocator.allocator();
 
     // align to vector reads (64 bytes)
-    const read_buffer = try allocator.alignedAlloc(u8, .@"64", 1024 * 1024);
+    // allocate a little extra to guarantee reads potentially past their known slices
+    const read_buffer = try allocator.alignedAlloc(u8, .@"64", 1024 * 1024 + 128);
     defer allocator.free(read_buffer);
 
-    var file_reader = file.reader(io, read_buffer);
+    var file_reader = file.reader(io, read_buffer[0..(1024 * 1024)]);
 
     var separator_bitmask_curr: u128 = 0;
     var state: union(enum) {
@@ -125,7 +126,32 @@ pub fn printStats(
                 state = .{ .reading_value = .{ .do_update = lookup.found_existing, .stats = lookup.value_ptr } };
             },
             .reading_value => |value_state| {
-                const value = try std.fmt.parseFloat(f32, buffer_curr);
+                const value: i16 = blk: {
+                    // load anything we could possibly use into a single register in one load.
+                    // safe because we added padding to any possible index returned, although those bytes may be garbage and unrelated
+                    assert(@intFromPtr(read_buffer.ptr) <= @intFromPtr(buffer_curr.ptr) and @intFromPtr(buffer_curr.ptr) < @intFromPtr(read_buffer.ptr) + file_reader.interface.buffer.len);
+                    const backing: @Vector(8, u8) = buffer_curr.ptr[0..8].*;
+                    const maybe_negative_sign, _, const maybe_decimal, _, _, _, _, _ = backing;
+                    
+                    if (maybe_negative_sign == '-' and maybe_decimal == '.') { // in format -x.x
+                        _, const ones, _, const tenths, _, _, _, _ = backing;
+                        break :blk -10 * @as(i16, ones - '0') - @as(i16, tenths - '0');
+                    } else if (maybe_negative_sign == '-' and maybe_decimal != '.') { // in format -xx.x
+                        assert('0' <= maybe_decimal and maybe_decimal <= '9');
+                        _, const tens, const ones, _, const tenths, _, _, _ = backing;
+                        break :blk -100 * @as(i16, tens - '0') - 10 * @as(i16, ones - '0') - @as(i16, tenths - '0');
+                    } else if (maybe_negative_sign != '-' and maybe_decimal == '.') { // in format xx.x
+                        assert('0' <= maybe_negative_sign and maybe_negative_sign <= '9');
+                        const tens, const ones, _, const tenths, _, _, _, _ = backing;
+                        break :blk 100 * @as(i16, tens - '0') + 10 * @as(i16, ones - '0') + @as(i16, tenths - '0');
+                    } else if (maybe_negative_sign != '-' and maybe_decimal != '.') { // in format x.x
+                        assert('0' <= maybe_negative_sign and maybe_negative_sign <= '9');
+                        assert('0' <= maybe_decimal and maybe_decimal <= '9');
+                        const ones, _, const tenths, _, _, _, _, _ = backing;
+                        break :blk 10 * @as(i16, ones - '0') + @as(i16, tenths - '0');
+                    } else { unreachable; }
+                };
+                assert(value == @trunc(try std.fmt.parseFloat(f32, buffer_curr) * 10));
                 var new_value: StationStats = undefined;
                 if (value_state.do_update) {
                     new_value = .{
@@ -183,13 +209,15 @@ pub fn printStats(
         try writer.print("{s}=", .{name});
         const stats = stats_buffer[i];
         const average = blk: {
-            const partial_result = @floor(stats.sum * 10 + 0.5) / 10 / @as(f64, stats.count);
-            // apparently this works for Java Math, so it works for me
-            break :blk @floor(partial_result * 10 + 0.5) / 10;
+            const partial_result = @divTrunc(stats.sum * 10, @as(i64, @intCast(stats.count)));
+            break :blk @divFloor(partial_result + 5, 10);
         };
         try writer.print(
-            "{d:.1}/{d:.1}/{d:.1}",
-            .{stats.min, average, stats.max}
+            "{s}{d}.{d}/{s}{d}.{d}/{s}{d}.{d}",
+            .{
+                if (stats.min < 0) "-" else "", @abs(@divTrunc(stats.min, 10)), @abs(@rem(stats.min, 10)),
+                if (average < 0) "-" else "", @abs(@divTrunc(average, 10)), @abs(@rem(average, 10)),
+                if (stats.max < 0) "-" else "", @abs(@divTrunc(stats.max, 10)), @abs(@rem(stats.max, 10))}
         );
     }
     try writer.print("}}\n", .{});
