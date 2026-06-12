@@ -37,10 +37,10 @@ pub fn printStats(
 
     // align to vector reads (64 bytes)
     // allocate a little extra to guarantee reads potentially past their known slices
-    const read_buffer = try allocator.alignedAlloc(u8, .@"64", 1024 * 1024);
+    const read_buffer = try allocator.alignedAlloc(u8, .@"64", 1024 * 1024 + 128);
     defer allocator.free(read_buffer);
 
-    var file_reader = file.reader(io, read_buffer);
+    var file_reader = file.reader(io, read_buffer[0..(1024 * 1024)]);
 
     var separator_bitmask_curr: u128 = 0;
     var state: union(enum) {
@@ -128,30 +128,27 @@ pub fn printStats(
             },
             .reading_value => |value_state| {
                 const value: i16 = blk: {
-                    const maybe_negative_sign = buffer_curr[0];
-                    const maybe_decimal = buffer_curr[2];
+                    // load anything we could possibly use into a single register in one load.
+                    // safe because we added padding to any possible index returned, although those bytes may be garbage and unrelated
+                    assert(@intFromPtr(read_buffer.ptr) <= @intFromPtr(buffer_curr.ptr) and @intFromPtr(buffer_curr.ptr) < @intFromPtr(read_buffer.ptr) + file_reader.interface.buffer.len);
+                    const backing: @Vector(8, u8) = buffer_curr.ptr[0..8].*;
+                    const maybe_negative_sign, _, const maybe_decimal, _, _, _, _, _ = backing;
                     
                     if (maybe_negative_sign == '-' and maybe_decimal == '.') { // in format -x.x
-                        const ones = buffer_curr[1];
-                        const tenths = buffer_curr[3];
+                        _, const ones, _, const tenths, _, _, _, _ = backing;
                         break :blk -10 * @as(i16, ones - '0') - @as(i16, tenths - '0');
                     } else if (maybe_negative_sign == '-' and maybe_decimal != '.') { // in format -xx.x
                         assert('0' <= maybe_decimal and maybe_decimal <= '9');
-                        const tens = buffer_curr[1];
-                        const ones = buffer_curr[2];
-                        const tenths = buffer_curr[4];
+                        _, const tens, const ones, _, const tenths, _, _, _ = backing;
                         break :blk -100 * @as(i16, tens - '0') - 10 * @as(i16, ones - '0') - @as(i16, tenths - '0');
                     } else if (maybe_negative_sign != '-' and maybe_decimal == '.') { // in format xx.x
                         assert('0' <= maybe_negative_sign and maybe_negative_sign <= '9');
-                        const tens = buffer_curr[0];
-                        const ones = buffer_curr[1];
-                        const tenths = buffer_curr[3];
+                        const tens, const ones, _, const tenths, _, _, _, _ = backing;
                         break :blk 100 * @as(i16, tens - '0') + 10 * @as(i16, ones - '0') + @as(i16, tenths - '0');
                     } else if (maybe_negative_sign != '-' and maybe_decimal != '.') { // in format x.x
                         assert('0' <= maybe_negative_sign and maybe_negative_sign <= '9');
                         assert('0' <= maybe_decimal and maybe_decimal <= '9');
-                        const ones = buffer_curr[0];
-                        const tenths = buffer_curr[2];
+                        const ones, _, const tenths, _, _, _, _, _ = backing;
                         break :blk 10 * @as(i16, ones - '0') + @as(i16, tenths - '0');
                     } else { unreachable; }
                 };
