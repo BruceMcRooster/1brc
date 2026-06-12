@@ -1,5 +1,6 @@
 //! By convention, root.zig is the root source file when making a package.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const assert = std.debug.assert;
 
@@ -154,7 +155,9 @@ pub fn printStats(
                         break :blk 10 * @as(i16, ones - '0') + @as(i16, tenths - '0');
                     } else { unreachable; }
                 };
-                assert(value == @trunc(try std.fmt.parseFloat(f32, buffer_curr) * 10));
+                if (builtin.mode == .Debug) {
+                    assert(value == @trunc(try std.fmt.parseFloat(f32, buffer_curr) * 10));
+                }
                 var new_value: StationStats = undefined;
                 if (value_state.do_update) {
                     new_value = .{
