@@ -127,31 +127,7 @@ pub fn printStats(
                 state = .{ .reading_value = .{ .do_update = lookup.found_existing, .stats = lookup.value_ptr } };
             },
             .reading_value => |value_state| {
-                const value: i16 = blk: {
-                    // load anything we could possibly use into a single register in one load.
-                    // safe because we added padding to any possible index returned, although those bytes may be garbage and unrelated
-                    assert(@intFromPtr(read_buffer.ptr) <= @intFromPtr(buffer_curr.ptr) and @intFromPtr(buffer_curr.ptr) < @intFromPtr(read_buffer.ptr) + file_reader.interface.buffer.len);
-                    const backing: @Vector(8, u8) = buffer_curr.ptr[0..8].*;
-                    const maybe_negative_sign, _, const maybe_decimal, _, _, _, _, _ = backing;
-                    
-                    if (maybe_negative_sign == '-' and maybe_decimal == '.') { // in format -x.x
-                        _, const ones, _, const tenths, _, _, _, _ = backing;
-                        break :blk -10 * @as(i16, ones - '0') - @as(i16, tenths - '0');
-                    } else if (maybe_negative_sign == '-' and maybe_decimal != '.') { // in format -xx.x
-                        assert('0' <= maybe_decimal and maybe_decimal <= '9');
-                        _, const tens, const ones, _, const tenths, _, _, _ = backing;
-                        break :blk -100 * @as(i16, tens - '0') - 10 * @as(i16, ones - '0') - @as(i16, tenths - '0');
-                    } else if (maybe_negative_sign != '-' and maybe_decimal == '.') { // in format xx.x
-                        assert('0' <= maybe_negative_sign and maybe_negative_sign <= '9');
-                        const tens, const ones, _, const tenths, _, _, _, _ = backing;
-                        break :blk 100 * @as(i16, tens - '0') + 10 * @as(i16, ones - '0') + @as(i16, tenths - '0');
-                    } else if (maybe_negative_sign != '-' and maybe_decimal != '.') { // in format x.x
-                        assert('0' <= maybe_negative_sign and maybe_negative_sign <= '9');
-                        assert('0' <= maybe_decimal and maybe_decimal <= '9');
-                        const ones, _, const tenths, _, _, _, _, _ = backing;
-                        break :blk 10 * @as(i16, ones - '0') + @as(i16, tenths - '0');
-                    } else { unreachable; }
-                };
+                const value = parseFloat(buffer_curr);
                 if (builtin.mode == .Debug) {
                     assert(value == @trunc(try std.fmt.parseFloat(f32, buffer_curr) * 10));
                 }
@@ -225,4 +201,48 @@ pub fn printStats(
     }
     try writer.print("}}\n", .{});
     try writer.flush();
+}
+
+inline fn parseFloat(buffer_curr: []u8) i16 {
+    const backing: @Vector(8, u8) = buffer_curr.ptr[0..8].*;
+    
+    return extractFloat(backing);
+}
+
+inline fn extractFloat(backing: @Vector(8, u8)) i16 {
+    const maybe_negative_sign, _, const maybe_decimal, _, _, _, _, _ = backing;
+    
+    if (maybe_negative_sign == '-' and maybe_decimal == '.') { // in format -x.x
+        return getNegXDotX(backing);
+    } else if (maybe_negative_sign == '-' and maybe_decimal != '.') { // in format -xx.x
+        assert('0' <= maybe_decimal and maybe_decimal <= '9');
+        return getNegXXDotX(backing);
+    } else if (maybe_negative_sign != '-' and maybe_decimal == '.') { // in format xx.x
+        assert('0' <= maybe_negative_sign and maybe_negative_sign <= '9');
+        return getXXDotX(backing);
+    } else if (maybe_negative_sign != '-' and maybe_decimal != '.') { // in format x.x
+        assert('0' <= maybe_negative_sign and maybe_negative_sign <= '9');
+        assert('0' <= maybe_decimal and maybe_decimal <= '9');
+        return getXDotX(backing);
+    } else { unreachable; }
+}
+
+inline fn getNegXDotX(backing: @Vector(8, u8)) i16 {
+    _, const ones, _, const tenths, _, _, _, _ = backing;
+    return -10 * @as(i16, ones - '0') - @as(i16, tenths - '0');
+}
+
+inline fn getNegXXDotX(backing: @Vector(8, u8)) i16 {
+    _, const tens, const ones, _, const tenths, _, _, _ = backing;
+    return -100 * @as(i16, tens - '0') - 10 * @as(i16, ones - '0') - @as(i16, tenths - '0');
+}
+
+inline fn getXXDotX(backing: @Vector(8, u8)) i16 {
+    const tens, const ones, _, const tenths, _, _, _, _ = backing;
+    return 100 * @as(i16, tens - '0') + 10 * @as(i16, ones - '0') + @as(i16, tenths - '0');
+}
+
+inline fn getXDotX(backing: @Vector(8, u8)) i16 {
+    const ones, _, const tenths, _, _, _, _, _ = backing;
+    return 10 * @as(i16, ones - '0') + @as(i16, tenths - '0');
 }
