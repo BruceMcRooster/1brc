@@ -20,8 +20,8 @@ pub fn printStats(
     defer file.close(io);
 
     const StationStats = struct {
-        min: ixx,
-        max: ixx,
+        min: i16,
+        max: i16,
         sum: i64,
         count: u32
     };
@@ -129,7 +129,7 @@ pub fn printStats(
             .reading_value => |value_state| {
                 const value = parseFloat(buffer_curr);
                 if (builtin.mode == .Debug) {
-                    assert(value == @as(ixx, @trunc(try std.fmt.parseFloat(f32, buffer_curr) * 10)));
+                    assert(value == @as(i16, @trunc(try std.fmt.parseFloat(f32, buffer_curr) * 10)));
                 }
                 var new_value: StationStats = undefined;
                 if (value_state.do_update) {
@@ -203,26 +203,22 @@ pub fn printStats(
     try writer.flush();
 }
 
-// I want to experiment with different sizes easily
-const ixx = i16;
-const uxx = @Int(.unsigned, @typeInfo(ixx).int.bits);
-
-inline fn parseFloat(buffer_curr: []u8) ixx {
+inline fn parseFloat(buffer_curr: []u8) i16 {
     const is_neg: u1 = @intFromBool(buffer_curr[0] == '-');
     const signless_start: [*]const u8 = buffer_curr.ptr + is_neg;
     // 0 = x.x, 1 = xx.x
     const format_identifier: usize = @intFromBool(signless_start[1] != '.');
 
     // 0xF can be used to mask out upper bits and convert to int (since numbers are 0x30–0x39)
-    const d0: uxx = signless_start[0] & 0xF;
-    const hundreds: uxx = @as(uxx, @intCast(format_identifier)) * d0;
-    const tens: uxx = signless_start[format_identifier] & 0xF;
-    const ones: uxx = signless_start[format_identifier + 2] & 0xF;
+    const d0: u16 = signless_start[0] & 0xF;
+    const hundreds: u16 = @as(u16, @intCast(format_identifier)) * d0;
+    const tens: u16 = signless_start[format_identifier] & 0xF;
+    const ones: u16 = signless_start[format_identifier + 2] & 0xF;
     
-    const value: uxx = hundreds * 100 + tens * 10 + ones;
+    const value: u16 = hundreds * 100 + tens * 10 + ones;
 
     // conditional negation, branchlessly
-    const mask: uxx = @as(uxx, 0) -% is_neg;
+    const mask: u16 = @as(u16, 0) -% is_neg;
     return @bitCast((value ^ mask) -% mask);
 }
 
