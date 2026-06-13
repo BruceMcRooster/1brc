@@ -20,8 +20,8 @@ pub fn printStats(
     defer file.close(io);
 
     const StationStats = struct {
-        min: i16,
-        max: i16,
+        min: ixx,
+        max: ixx,
         sum: i64,
         count: u32
     };
@@ -129,7 +129,7 @@ pub fn printStats(
             .reading_value => |value_state| {
                 const value = parseFloat(buffer_curr);
                 if (builtin.mode == .Debug) {
-                    assert(value == @trunc(try std.fmt.parseFloat(f32, buffer_curr) * 10));
+                    assert(value == @as(ixx, @trunc(try std.fmt.parseFloat(f32, buffer_curr) * 10)));
                 }
                 var new_value: StationStats = undefined;
                 if (value_state.do_update) {
@@ -203,10 +203,27 @@ pub fn printStats(
     try writer.flush();
 }
 
-inline fn parseFloat(buffer_curr: []u8) i16 {
-    const backing: @Vector(8, u8) = buffer_curr.ptr[0..8].*;
+// I want to experiment with different sizes easily
+const ixx = i16;
+const uxx = @Int(.unsigned, @typeInfo(ixx).int.bits);
+
+inline fn parseFloat(buffer_curr: []u8) ixx {
+    const is_neg: u1 = @intFromBool(buffer_curr[0] == '-');
+    const signless_start: [*]const u8 = buffer_curr.ptr + is_neg;
+    // 0 = x.x, 1 = xx.x
+    const format_identifier: usize = @intFromBool(signless_start[1] != '.');
+
+    // 0xF can be used to mask out upper bits and convert to int (since numbers are 0x30–0x39)
+    const d0: uxx = signless_start[0] & 0xF;
+    const hundreds: uxx = @as(uxx, @intCast(format_identifier)) * d0;
+    const tens: uxx = signless_start[format_identifier] & 0xF;
+    const ones: uxx = signless_start[format_identifier + 2] & 0xF;
     
-    return extractFloat(backing);
+    const value: uxx = hundreds * 100 + tens * 10 + ones;
+
+    // conditional negation, branchlessly
+    const mask: uxx = @as(uxx, 0) -% is_neg;
+    return @bitCast((value ^ mask) -% mask);
 }
 
 inline fn extractFloat(backing: @Vector(8, u8)) i16 {
