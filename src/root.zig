@@ -205,9 +205,10 @@ pub fn printStats(
 
 inline fn parseFloat(buffer_curr: []u8) i16 {
     const is_neg: u1 = @intFromBool(buffer_curr[0] == '-');
+    const is_decimal_at_third: u1 = @intFromBool(buffer_curr[2] == '.');
     const signless_start: [*]const u8 = buffer_curr.ptr + is_neg;
     // 0 = x.x, 1 = xx.x
-    const format_identifier: usize = @intFromBool(signless_start[1] != '.');
+    const format_identifier: usize = is_decimal_at_third ^ is_neg;
 
     // 0xF can be used to mask out upper bits and convert to int (since numbers are 0x30–0x39)
     const d0: u16 = signless_start[0] & 0xF;
