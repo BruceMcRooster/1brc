@@ -8,6 +8,7 @@ if (( $# < 1 )); then
 fi
 
 INPUTFILE=$1
+TRACE_PATH="./trace_$(date +%Y%m%d_%H%M%S).trace"
 
 if [[ $# -ge 2 && "$2" == "--no-build" ]]; then
 		echo "Skipped building profiling executable"
@@ -23,8 +24,8 @@ codesign -s - -f --entitlements ./Entitlements.plist ./zig-out/bin/_1brc_profile
 
 rm Entitlements.plist # no sense in keeping it around
 
-xcrun xctrace record --template "Time Profiler" --launch -- ./zig-out/bin/_1brc_profile $INPUTFILE
+xcrun xctrace record --template "Time Profiler" --output "$TRACE_PATH" --launch -- ./zig-out/bin/_1brc_profile $INPUTFILE
 
 echo "Opening traces in Instruments"
 
-open *.trace
+open "$TRACE_PATH"
