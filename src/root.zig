@@ -161,24 +161,41 @@ inline fn finalPrint(allocator: *const std.mem.Allocator, hashmap: std.StringHas
     try writer.flush();
 }
 
+// credit to @merykitty for this implementation
+// and https://questdb.com/blog/billion-row-challenge-step-by-step/ for explaining
 inline fn parseFloat(buffer_curr: []u8) i16 {
-    const is_neg: u1 = @intFromBool(buffer_curr[0] == '-');
-    const is_decimal_at_third: u1 = @intFromBool(buffer_curr[2] == '.');
-    const signless_start: [*]const u8 = buffer_curr.ptr + is_neg;
-    // 0 = x.x, 1 = xx.x
-    const format_identifier: usize = is_decimal_at_third ^ is_neg;
+    // we can read 1 64-bit value to always get the up to 5 bytes of the number representation
+    // safe because we added extra padding to the buffer
+    const number_bytes = @as(*align(1) u64, @ptrCast(buffer_curr.ptr)).*;
+    const inv_number_bytes = ~number_bytes;
 
-    // 0xF can be used to mask out upper bits and convert to int (since numbers are 0x30–0x39)
-    const d0: u16 = signless_start[0] & 0xF;
-    const hundreds: u16 = @as(u16, @intCast(format_identifier)) * d0;
-    const tens: u16 = signless_start[format_identifier] & 0xF;
-    const ones: u16 = signless_start[format_identifier + 2] & 0xF;
-    
-    const value: u16 = hundreds * 100 + tens * 10 + ones;
+    // downcasting to u32 to get a u6 instead of a u7,
+    // because Zig wants a u6 for the shift by _28_minus_dot_pos later.
+    // totally safe because mask will remove any higher bits
+    const dot_pos: u6 = @ctz(@as(u32, @intCast(inv_number_bytes & 0x10101000)));
+    // micro-optimization: can save one instruction (xor 28 instead of mov 28, sub that other)
+    const _28_minus_dot_pos = dot_pos ^ 0b11100;
+    // inverse of '-' (0x2D) has 0x10 bit toggled, while any numbers (0x30–0x39) do not,
+    // so get a mask of all 1's if that is set in the first byte (it's a '-') or 0's otherwise
+    const signed: u64 = @bitCast(@as(i64, @bitCast(inv_number_bytes << 59)) >> 63);
+    const minus_filter = ~(signed & 0xFF);
 
-    // conditional negation, branchlessly
-    const mask: u16 = @as(u16, 0) -% is_neg;
-    return @bitCast((value ^ mask) -% mask);
+    // extract the decimal values (0–9 is 0x30–0x39, so 0xF mask gets values)
+    // at the computed positions of each decimal
+    const digits = ((number_bytes & minus_filter) << _28_minus_dot_pos) & 0x0F000F0F00;
+
+    // Multiplies each digit with the appropriate power of ten.
+    // Representing 0 as . for readability,
+    // 0x.......U...T.H.. * (100 * 0x1000000 + 10 * 0x10000 + 1) =
+    // 0x.U...T.H........ * 100 +
+    // 0x...U...T.H...... * 10 +
+    // 0x.......U...T.H..
+    //          ^--- H, T, and U are lined up here.
+    // This results in our temperature lying in bits 32 to 41 of this product.
+    const MAGIC_MULTIPLIER = (100 * 0x1000000 + 10 * 0x10000 + 1);
+    const abs_value = ((digits *% MAGIC_MULTIPLIER) >> 32) & 0x3FF;
+    // sign is either all 1's or all 0's, so this conditionally negates
+    return @as(i16, @truncate(@as(i64, @bitCast((abs_value +% signed) ^ signed))));
 }
 
 inline fn handleNonzeroBitmask(separator_bitmask_curr: *u128, read_buffer: []u8, reader: *Io.Reader) []u8 {
