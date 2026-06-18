@@ -45,64 +45,109 @@ pub fn printStats(
     var string_buffer_allocator = std.heap.FixedBufferAllocator.init(string_buffer);
     const string_allocator = string_buffer_allocator.allocator();
 
-    // align to vector reads (64 bytes)
+    const veclen = std.simd.suggestVectorLength(u8) orelse 8; // orelse must fall back to at least 6
+    comptime assert(veclen >= 6); // so that a float value (including newline) never crosses two boundaries
+    
+    // align to vector reads
     // allocate a little extra to guarantee reads potentially past their known slices
-    const read_buffer = try allocator.alignedAlloc(u8, .@"64", 1024 * 1024 + 128);
+    const read_buffer = try allocator.alignedAlloc(u8, .fromByteUnits(veclen), 1024 * 1024 + 128);
     defer allocator.free(read_buffer);
 
     var file_reader = file.reader(io, read_buffer[0..(1024 * 1024)]);
+    
+    var semicolon_bitmask_curr: @Int(.unsigned, veclen) = undefined;
+    var vector_start_offset: usize = undefined;
+    var newline_last: usize = undefined;
 
-    var separator_bitmask_curr: u128 = 0;
-    var state: State = .reading_name;
+    while (file_reader.interface.fillMore()) {
+        assert(file_reader.interface.seek == 0);
+        newline_last = std.mem.findLast(u8, read_buffer[0..file_reader.interface.end], "\n") orelse unreachable;
+        vector_start_offset = 0;
+        semicolon_bitmask_curr = grabSemicolonBitmask(veclen, @ptrCast(read_buffer.ptr));
 
-    readloop: while (true) {
-        const buffer_curr: []u8 = get_buff: {
-            if (separator_bitmask_curr != 0) {
-                break :get_buff handleNonzeroBitmask(&separator_bitmask_curr, read_buffer, &file_reader.interface);
-            } else {
-                break :get_buff handleZeroBitmask(&separator_bitmask_curr, read_buffer, &file_reader.interface, state) catch |err| switch (err) {
-                    error.EndOfStream => {
-                        break :readloop;
-                    },
-                    else => {
-                        @branchHint(.cold);
-                        return err;
-                    }
-                };
+        while (file_reader.interface.seek < newline_last) {
+            while (semicolon_bitmask_curr == 0) {
+                vector_start_offset += veclen;
+                semicolon_bitmask_curr = grabSemicolonBitmask(veclen, @alignCast(@ptrCast(read_buffer.ptr + vector_start_offset)));
             }
-        }; // buffer_curr
-        switch (state) {
-            .reading_name => {
-                const lookup = try hashmap.getOrPut(buffer_curr);
-                if (!lookup.found_existing) {
-                    const allocated_name = try string_allocator.alloc(u8, buffer_curr.len);
-                    _ = @memcpy(allocated_name, buffer_curr);
-                    lookup.key_ptr.* = allocated_name;
-                }
-                state = .{ .reading_value = .{ .do_update = lookup.found_existing, .stats = lookup.value_ptr } };
-            },
-            .reading_value => |value_state| {
-                const value = parseFloat(buffer_curr);
-                if (builtin.mode == .Debug) {
-                    assert(value == @as(i16, @trunc(try std.fmt.parseFloat(f32, buffer_curr) * 10)));
-                }
-                var new_value: StationStats = undefined;
-                if (value_state.do_update) {
-                    new_value = .{
-                        .min = @min(value_state.stats.min, value),
-                        .max = @max(value_state.stats.max, value),
-                        .sum = value_state.stats.sum + value,
-                        .count = value_state.stats.count + 1,
-                    };
-                } else {
-                    new_value = .{ .min = value, .max = value, .sum = value, .count = 1 };
-                }
-                value_state.stats.* = new_value;
+            const name: []u8 = read_buffer[file_reader.interface.seek..vector_start_offset + @ctz(semicolon_bitmask_curr)];
+            semicolon_bitmask_curr ^= @as(@Int(.unsigned, veclen), 1) << @intCast(@ctz(semicolon_bitmask_curr));
 
-                state = .reading_name;
+            file_reader.interface.toss(name.len + 1); // plus 1 for the ';'
+
+            // credit to @merykitty for this implementation
+            // and https://questdb.com/blog/billion-row-challenge-step-by-step/ for explaining
+            const value: i16 = read_value: {
+                const value_ptr_start: *align(1) u64 = @ptrCast(read_buffer.ptr + file_reader.interface.seek);
+                const number_bytes = value_ptr_start.*;
+                const inv_number_bytes = ~number_bytes;
+            
+                // downcasting to u32 to get a u6 instead of a u7,
+                // because Zig wants a u6 for the shift by _28_minus_dot_pos later.
+                // totally safe because mask will remove any higher bits
+                const dot_pos: u6 = @ctz(@as(u32, @intCast(inv_number_bytes & 0x10101000)));
+                // micro-optimization: can save one instruction (xor 28 instead of mov 28, sub that other)
+                const _28_minus_dot_pos = dot_pos ^ 0b11100;
+                // inverse of '-' (0x2D) has 0x10 bit toggled, while any numbers (0x30–0x39) do not,
+                // so get a mask of all 1's if that is set in the first byte (it's a '-') or 0's otherwise
+                const signed: u64 = @bitCast(@as(i64, @bitCast(inv_number_bytes << 59)) >> 63);
+                const minus_filter = ~(signed & 0xFF);
+            
+                // extract the decimal values (0–9 is 0x30–0x39, so 0xF mask gets values)
+                // at the computed positions of each decimal
+                const digits = ((number_bytes & minus_filter) << _28_minus_dot_pos) & 0x0F000F0F00;
+            
+                // Multiplies each digit with the appropriate power of ten.
+                // Representing 0 as . for readability,
+                // 0x.......U...T.H.. * (100 * 0x1000000 + 10 * 0x10000 + 1) =
+                // 0x.U...T.H........ * 100 +
+                // 0x...U...T.H...... * 10 +
+                // 0x.......U...T.H..
+                //          ^--- H, T, and U are lined up here.
+                // This results in our temperature lying in bits 32 to 41 of this product.
+                const MAGIC_MULTIPLIER = (100 * 0x1000000 + 10 * 0x10000 + 1);
+                const abs_value = ((digits *% MAGIC_MULTIPLIER) >> 32) & 0x3FF;
+                // sign is either all 1's or all 0's, so this conditionally negates
+                const result = @as(i16, @truncate(@as(i64, @bitCast((abs_value +% signed) ^ signed))));
+
+                // advance the file reader past the value and newline
+                const prev_seek = file_reader.interface.seek;
+                file_reader.interface.toss(@intCast(
+                    -@as(i64, @bitCast(signed)) // possibly a negative sign
+                    + @intFromBool(abs_value > 99) // possibly a 10s place
+                    + 3 // x.x
+                    + 1 // \n
+                ));
+                assert(read_buffer[file_reader.interface.seek - 1] == '\n');
+                const multiple_of_veclen_mask = ~(@as(usize, veclen) - 1);
+                // detect if we crossed a vector boundary (can cross one at max)
+                assert(prev_seek & multiple_of_veclen_mask == file_reader.interface.seek & multiple_of_veclen_mask
+                    or semicolon_bitmask_curr == 0); // if we did cross a vector boundary, we should be out of existing semicolons
+                                                     // so that the iterator will increment the vector start offset and find a new one
+                    
+                break :read_value result;
+            };
+            
+            const lookup = try hashmap.getOrPut(name);
+            if (!lookup.found_existing) {
+                const allocated_name = try string_allocator.alloc(u8, name.len);
+                _ = @memcpy(allocated_name, name);
+                lookup.key_ptr.* = allocated_name;
+                lookup.value_ptr.* = .{ .min = value, .max = value, .sum = value, .count = 1 };
+            } else {
+                lookup.value_ptr.*.min = @min(lookup.value_ptr.*.min, value);
+                lookup.value_ptr.*.max = @max(lookup.value_ptr.*.max, value);
+                lookup.value_ptr.*.sum += value;
+                lookup.value_ptr.*.count += 1;
             }
         }
+    } else |fill_err| switch (fill_err) {
+        error.EndOfStream => {},
+        else => {
+            return fill_err;
+        },
     }
+    
     try finalPrint(&allocator, hashmap, writer);
 }
 
@@ -161,104 +206,10 @@ inline fn finalPrint(allocator: *const std.mem.Allocator, hashmap: std.StringHas
     try writer.flush();
 }
 
-// credit to @merykitty for this implementation
-// and https://questdb.com/blog/billion-row-challenge-step-by-step/ for explaining
-inline fn parseFloat(buffer_curr: []u8) i16 {
-    // we can read 1 64-bit value to always get the up to 5 bytes of the number representation
-    // safe because we added extra padding to the buffer
-    const number_bytes = @as(*align(1) u64, @ptrCast(buffer_curr.ptr)).*;
-    const inv_number_bytes = ~number_bytes;
-
-    // downcasting to u32 to get a u6 instead of a u7,
-    // because Zig wants a u6 for the shift by _28_minus_dot_pos later.
-    // totally safe because mask will remove any higher bits
-    const dot_pos: u6 = @ctz(@as(u32, @intCast(inv_number_bytes & 0x10101000)));
-    // micro-optimization: can save one instruction (xor 28 instead of mov 28, sub that other)
-    const _28_minus_dot_pos = dot_pos ^ 0b11100;
-    // inverse of '-' (0x2D) has 0x10 bit toggled, while any numbers (0x30–0x39) do not,
-    // so get a mask of all 1's if that is set in the first byte (it's a '-') or 0's otherwise
-    const signed: u64 = @bitCast(@as(i64, @bitCast(inv_number_bytes << 59)) >> 63);
-    const minus_filter = ~(signed & 0xFF);
-
-    // extract the decimal values (0–9 is 0x30–0x39, so 0xF mask gets values)
-    // at the computed positions of each decimal
-    const digits = ((number_bytes & minus_filter) << _28_minus_dot_pos) & 0x0F000F0F00;
-
-    // Multiplies each digit with the appropriate power of ten.
-    // Representing 0 as . for readability,
-    // 0x.......U...T.H.. * (100 * 0x1000000 + 10 * 0x10000 + 1) =
-    // 0x.U...T.H........ * 100 +
-    // 0x...U...T.H...... * 10 +
-    // 0x.......U...T.H..
-    //          ^--- H, T, and U are lined up here.
-    // This results in our temperature lying in bits 32 to 41 of this product.
-    const MAGIC_MULTIPLIER = (100 * 0x1000000 + 10 * 0x10000 + 1);
-    const abs_value = ((digits *% MAGIC_MULTIPLIER) >> 32) & 0x3FF;
-    // sign is either all 1's or all 0's, so this conditionally negates
-    return @as(i16, @truncate(@as(i64, @bitCast((abs_value +% signed) ^ signed))));
-}
-
-inline fn handleNonzeroBitmask(separator_bitmask_curr: *u128, read_buffer: []u8, reader: *Io.Reader) []u8 {
-    const buffer_start = reader.seek;
-    const buffer_end = blk: {
-        const separator_bitmask_start = buffer_start & ~@as(usize, 127); // round down to nearest multiple of 128
-        const next_offset: usize = @ctz(separator_bitmask_curr.*);
-        assert(next_offset < 128); // not at the end, because we know it wasn't zero
-        break :blk separator_bitmask_start + next_offset;
-    };
-    separator_bitmask_curr.* ^= @as(u128, 1) << @intCast(@ctz(separator_bitmask_curr.*));
-    const new_buff = read_buffer[buffer_start..buffer_end];
-    reader.toss(new_buff.len + 1); // add one for separator
-    return new_buff;
-}
-
-inline fn handleZeroBitmask(separator_bitmask_curr: *u128, read_buffer: []u8, reader: *Io.Reader, state: State) ![]u8 {
-    // the size required to be loaded so we can safely read the next vector.
-    // because when asking for this sizing to be available with fill,
-    // we may be rebased to the beginning, we may not end up reading all of it,
-    // but this is what is required if that is not the case
-    const required_size_next: usize = blk: {
-        const up_to_next_128_multiple = ((reader.seek + 127) & ~@as(usize, 127)) - reader.seek;
-        break :blk 128 + up_to_next_128_multiple;
-    };
-    if (reader.fill(required_size_next)) {
-        // have to reread here, because it may have changed due to rebase in fill
-        const buffer_start = reader.seek;
-        
-        const next_vec_start = (reader.seek + 127) & ~@as(usize, 127);
-        separator_bitmask_curr.* = grabNewSeparatorBitmask(read_buffer, next_vec_start);
-        const in_vec_separator_offset: usize = @ctz(separator_bitmask_curr.*);
-        separator_bitmask_curr.* ^= @as(u128, 1) << @intCast(in_vec_separator_offset);
-        const buffer_end = next_vec_start + in_vec_separator_offset;
-
-        const new_buff = read_buffer[buffer_start..buffer_end];
-        reader.toss(new_buff.len + 1); // +1 for separator
-        return new_buff;
-    } else |err| {
-        if (err == error.ReadFailed) {
-            @branchHint(.cold);
-            return err;
-        }
-        // EndOfStream indicates we cannot make another full vectorized read
-        // so we must instead use simpler techniques
-        switch (state) {
-            .reading_name => {
-                // returns null if at the end of the stream (0 bytes remain), which signals we're done reading
-                return try reader.takeDelimiter(';') orelse return err;
-            },
-            .reading_value => {
-                // probably won't ever return null (out of bytes) since generated files have final newlines
-                // (it will fail the next time around while reading name),
-                // but just in case, it's handled
-                return try reader.takeDelimiter('\n') orelse return err;
-            }
-        }
-    }
-}
-
-inline fn grabNewSeparatorBitmask(read_buffer: []u8, next_vec_start: usize) u128 {
-    const array: *align(64) [128]u8 = @ptrCast(@alignCast(read_buffer[next_vec_start..][0..128]));
-    const vec: @Vector(128, u8) = array.*;
-    const separators = (vec == @as(@Vector(128, u8), @splat(';'))) | (vec == @as(@Vector(128, u8), @splat('\n')));
-    return @bitCast(separators);
+fn grabSemicolonBitmask(veclen: comptime_int, ptr: *const @Vector(veclen, u8)) @Int(.unsigned, veclen) {
+    const Int = @Int(.unsigned, veclen);
+    const Vec = @Vector(veclen, u8);
+    const vec: Vec = ptr.*;
+    const semicolons: Int = @bitCast(vec == @as(Vec, @splat(';')));
+    return semicolons;
 }
