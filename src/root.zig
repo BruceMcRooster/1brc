@@ -191,7 +191,7 @@ inline fn finalPrint(allocator: *const std.mem.Allocator, hashmap: std.StringHas
         try writer.print("{s}=", .{name});
         const stats = stats_buffer[i];
         const average = blk: {
-            const partial_result = @divTrunc(stats.sum * 10, @as(i64, @intCast(stats.count)));
+            const partial_result = @divFloor(stats.sum * 10, @as(i64, @intCast(stats.count)));
             break :blk @divFloor(partial_result + 5, 10);
         };
         try writer.print(
