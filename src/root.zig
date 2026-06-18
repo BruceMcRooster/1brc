@@ -128,7 +128,7 @@ pub fn printStats(
                 break :read_value result;
             };
             
-            const lookup = try hashmap.getOrPut(name);
+            const lookup = hashmap.getOrPutAssumeCapacityAdapted(name, hashmap.ctx);
             if (!lookup.found_existing) {
                 const allocated_name = try string_allocator.alloc(u8, name.len);
                 _ = @memcpy(allocated_name, name);
