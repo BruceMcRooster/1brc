@@ -42,12 +42,13 @@ pub fn printStats(
     const hashmap_len = comptime std.math.ceilPowerOfTwo(usize, max_unique_station_count * 4) catch unreachable;
     const hashmap = try allocator.alloc(
         packed struct {
-            top_hash: u48, // saves on needing to compare strings, hopefully
-            buffer_offset: u16, // needs to be larger than mmax_unique_station_count
+            name_len: u8,
+            top_hash: u8,
+            buffer_index: u16,
         },
         hashmap_len,
     );
-    @memset(hashmap, @bitCast(@as(u64, 0)));
+    @memset(hashmap, @bitCast(@as(u32, 0)));
     defer allocator.free(hashmap);
 
     // plus one lets us use it as a temp buffer
@@ -82,10 +83,10 @@ pub fn printStats(
                 vector_start_offset += veclen;
                 semicolon_bitmask_curr = grabSemicolonBitmask(veclen, @alignCast(@ptrCast(read_buffer.ptr + vector_start_offset)));
             }
-            const name: []u8 = read_buffer[file_reader.interface.seek..vector_start_offset + @ctz(semicolon_bitmask_curr)];
+            const name: []u8 = read_buffer[file_reader.interface.seek..vector_start_offset + @ctz(semicolon_bitmask_curr) + 1]; // plus 1 for the ';'
             semicolon_bitmask_curr ^= @as(@Int(.unsigned, veclen), 1) << @intCast(@ctz(semicolon_bitmask_curr));
 
-            file_reader.interface.toss(name.len + 1); // plus 1 for the ';'
+            file_reader.interface.toss(name.len);
 
             // credit to @merykitty for this implementation
             // and https://questdb.com/blog/billion-row-challenge-step-by-step/ for explaining
@@ -139,25 +140,25 @@ pub fn printStats(
                     
                 break :read_value result;
             };
-            
-            // look up the value in the hashmap
-            const temp_or_new_name = &name_buffer[next_buffer_insert_index];
-            temp_or_new_name.* = .{0} ** 128;
-            @memcpy(temp_or_new_name[0..name.len], name);
 
-            const name_hash = std.hash.XxHash3.hash(0xDEADB33F, temp_or_new_name);
+            const name_hash = std.hash.XxHash3.hash(0xDEADB33F, name);
             comptime assert(std.math.isPowerOfTwo(hashmap_len));
             var hashmap_index: @Int(.unsigned, @ctz(hashmap_len)) = @intCast(name_hash % hashmap_len);
+            const expected_value: u32 = @intCast(((name_hash >> 48) & 0xFF00) | @as(u8, @intCast(name.len)));
+            assert(blk: {
+                const extract = @as(@typeInfo(@TypeOf(hashmap)).pointer.child, @bitCast(expected_value));
+                break :blk extract.top_hash == (name_hash >> 56) and extract.name_len == name.len and extract.buffer_index == 0;
+            });
 
-            while (@as(u64, @bitCast(hashmap[hashmap_index])) != 0) : (hashmap_index +%= 1) {
+            while (@as(u32, @bitCast(hashmap[hashmap_index])) != 0) : (hashmap_index +%= 1) {
                 // TODO: check the assembly to make sure this just masks the value
-                if (@as(u64, hashmap[hashmap_index].top_hash) << 16 != name_hash & ~@as(u64, 0xFFFF)) {
+                if (@as(u32, @bitCast(hashmap[hashmap_index])) & 0xFFFF != expected_value) {
                     continue;
                 }
                 // TODO: probably unroll this into definitely vectorized comparison, or check the assembly
-                if (std.mem.eql(u8, temp_or_new_name, &name_buffer[hashmap[hashmap_index].buffer_offset])) {
+                if (std.mem.eql(u8, name, name_buffer[hashmap[hashmap_index].buffer_index][0..name.len])) {
                     // found existing value
-                    const buffer_index = hashmap[hashmap_index].buffer_offset;
+                    const buffer_index = hashmap[hashmap_index].buffer_index;
                     stats_buffer[buffer_index].count += 1;
                     stats_buffer[buffer_index].sum += value;
                     stats_buffer[buffer_index].min = @min(stats_buffer[buffer_index].min, value);
@@ -166,8 +167,9 @@ pub fn printStats(
                 }
             } else {
                 // no existing value, now at an open slot (zeroed)
-                hashmap[hashmap_index] = .{ .top_hash = @intCast(name_hash >> 16), .buffer_offset = next_buffer_insert_index };
+                hashmap[hashmap_index] = .{ .top_hash = @intCast(name_hash >> 56), .name_len = @intCast(name.len), .buffer_index = next_buffer_insert_index };
                 stats_buffer[next_buffer_insert_index] = .{ .count = 1, .sum = value, .min = value, .max = value };
+                @memcpy(name_buffer[next_buffer_insert_index][0..name.len], name);
                 next_buffer_insert_index += 1;
             }
         }
@@ -205,7 +207,7 @@ inline fn finalPrint(name_buffer: [][128]u8, stats_buffer: []StationStats, write
     for (name_buffer, 0..) |name, i| {
         if (i > 0) try writer.print(", ", .{});
                                             // need to slice at null terminator to avoid printing garbage
-        try writer.print("{s}=", .{std.mem.sliceTo(&name, 0)});
+        try writer.print("{s}=", .{std.mem.sliceTo(&name, ';')});
         const stats = stats_buffer[i];
         const average = blk: {
             const partial_result = @divFloor(stats.sum * 10, @as(i64, @intCast(stats.count)));
