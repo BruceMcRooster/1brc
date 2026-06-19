@@ -35,15 +35,27 @@ pub fn printStats(
 ) !void {
     const file = try Io.Dir.openFile(Io.Dir.cwd(), io, file_name, .{ .mode = .read_only });
     defer file.close(io);
-    
-    var hashmap = std.StringHashMap(StationStats).init(allocator);
-    try hashmap.ensureTotalCapacity(max_unique_station_count * 4); // vibes-based number, will get rounded up to nearest power of 2 internally
-    defer hashmap.deinit();
 
-    const string_buffer = try allocator.alloc(u8, max_station_name_length * max_unique_station_count);
-    defer allocator.free(string_buffer);
-    var string_buffer_allocator = std.heap.FixedBufferAllocator.init(string_buffer);
-    const string_allocator = string_buffer_allocator.allocator();
+    comptime assert(max_station_name_length <= 128);
+
+    // vibes-based length, should keep number of collisions low
+    const hashmap_len = comptime std.math.ceilPowerOfTwo(usize, max_unique_station_count * 4) catch unreachable;
+    const hashmap = try allocator.alloc(
+        packed struct {
+            top_hash: u48, // saves on needing to compare strings, hopefully
+            buffer_offset: u16, // needs to be larger than mmax_unique_station_count
+        },
+        hashmap_len,
+    );
+    @memset(hashmap, @bitCast(@as(u64, 0)));
+    defer allocator.free(hashmap);
+
+    // plus one lets us use it as a temp buffer
+    const name_buffer = try allocator.alignedAlloc([128]u8, .@"64", max_unique_station_count + 1);
+    defer allocator.free(name_buffer);
+    const stats_buffer = try allocator.alloc(StationStats, max_unique_station_count);
+    defer allocator.free(stats_buffer);
+    var next_buffer_insert_index: u16 = 0;
 
     const veclen = std.simd.suggestVectorLength(u8) orelse 8; // orelse must fall back to at least 6
     comptime assert(veclen >= 6); // so that a float value (including newline) never crosses two boundaries
@@ -128,17 +140,35 @@ pub fn printStats(
                 break :read_value result;
             };
             
-            const lookup = hashmap.getOrPutAssumeCapacityAdapted(name, hashmap.ctx);
-            if (!lookup.found_existing) {
-                const allocated_name = try string_allocator.alloc(u8, name.len);
-                _ = @memcpy(allocated_name, name);
-                lookup.key_ptr.* = allocated_name;
-                lookup.value_ptr.* = .{ .min = value, .max = value, .sum = value, .count = 1 };
+            // look up the value in the hashmap
+            const temp_or_new_name = &name_buffer[next_buffer_insert_index];
+            temp_or_new_name.* = .{0} ** 128;
+            @memcpy(temp_or_new_name[0..name.len], name);
+
+            const name_hash = std.hash.XxHash3.hash(0xDEADB33F, temp_or_new_name);
+            comptime assert(std.math.isPowerOfTwo(hashmap_len));
+            var hashmap_index: @Int(.unsigned, @ctz(hashmap_len)) = @intCast(name_hash % hashmap_len);
+
+            while (@as(u64, @bitCast(hashmap[hashmap_index])) != 0) : (hashmap_index +%= 1) {
+                // TODO: check the assembly to make sure this just masks the value
+                if (@as(u64, hashmap[hashmap_index].top_hash) << 16 != name_hash & ~@as(u64, 0xFFFF)) {
+                    continue;
+                }
+                // TODO: probably unroll this into definitely vectorized comparison, or check the assembly
+                if (std.mem.eql(u8, temp_or_new_name, &name_buffer[hashmap[hashmap_index].buffer_offset])) {
+                    // found existing value
+                    const buffer_index = hashmap[hashmap_index].buffer_offset;
+                    stats_buffer[buffer_index].count += 1;
+                    stats_buffer[buffer_index].sum += value;
+                    stats_buffer[buffer_index].min = @min(stats_buffer[buffer_index].min, value);
+                    stats_buffer[buffer_index].max = @max(stats_buffer[buffer_index].max, value);
+                    break;
+                }
             } else {
-                lookup.value_ptr.*.min = @min(lookup.value_ptr.*.min, value);
-                lookup.value_ptr.*.max = @max(lookup.value_ptr.*.max, value);
-                lookup.value_ptr.*.sum += value;
-                lookup.value_ptr.*.count += 1;
+                // no existing value, now at an open slot (zeroed)
+                hashmap[hashmap_index] = .{ .top_hash = @intCast(name_hash >> 16), .buffer_offset = next_buffer_insert_index };
+                stats_buffer[next_buffer_insert_index] = .{ .count = 1, .sum = value, .min = value, .max = value };
+                next_buffer_insert_index += 1;
             }
         }
     } else |fill_err| switch (fill_err) {
@@ -148,47 +178,34 @@ pub fn printStats(
         },
     }
     
-    try finalPrint(&allocator, hashmap, writer);
+    try finalPrint(name_buffer[0..next_buffer_insert_index], stats_buffer[0..next_buffer_insert_index], writer);
 }
 
-inline fn finalPrint(allocator: *const std.mem.Allocator, hashmap: std.StringHashMap(StationStats), writer: *Io.Writer) !void {
-    var name_buffer = try allocator.alloc([]const u8, hashmap.count());
-    defer allocator.free(name_buffer);
-    var stats_buffer = try allocator.alloc(StationStats, hashmap.count());
-    defer allocator.free(stats_buffer);
-    
-    var iterator = hashmap.iterator();
-    var curr_index: usize = 0;
-    while (iterator.next()) |entry| {
-        const name = entry.key_ptr.*;
-        const stats = entry.value_ptr.*;
-        name_buffer[curr_index] = name;
-        stats_buffer[curr_index] = stats;
-        curr_index += 1;
-    }
-
+inline fn finalPrint(name_buffer: [][128]u8, stats_buffer: []StationStats, writer: *Io.Writer) !void {
     const sort_context: struct {
-        name_buffer: [][]const u8,
+        name_buffer: [][128] u8,
         stats_buffer: []StationStats,
 
         pub fn swap(self: *const @This(), elem1: usize, elem2: usize) void {
-            std.mem.swap([]const u8, &self.name_buffer[elem1], &self.name_buffer[elem2]);
+            std.mem.swap([128]u8, &self.name_buffer[elem1], &self.name_buffer[elem2]);
             std.mem.swap(StationStats, &self.stats_buffer[elem1], &self.stats_buffer[elem2]);
         }
 
         pub fn lessThan(self: *const @This(), elem1: usize, elem2: usize) bool {
-            return std.mem.lessThan(u8, self.name_buffer[elem1], self.name_buffer[elem2]);
+            return std.mem.lessThan(u8, &self.name_buffer[elem1], &self.name_buffer[elem2]);
         }
-    } = .{ 
+    } = .{
         .name_buffer = name_buffer,
         .stats_buffer = stats_buffer,
     };
     
     std.sort.heapContext(0, name_buffer.len, sort_context);
+    
     try writer.print("{{", .{});
     for (name_buffer, 0..) |name, i| {
         if (i > 0) try writer.print(", ", .{});
-        try writer.print("{s}=", .{name});
+                                            // need to slice at null terminator to avoid printing garbage
+        try writer.print("{s}=", .{std.mem.sliceTo(&name, 0)});
         const stats = stats_buffer[i];
         const average = blk: {
             const partial_result = @divFloor(stats.sum * 10, @as(i64, @intCast(stats.count)));
