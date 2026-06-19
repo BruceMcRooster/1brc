@@ -72,6 +72,11 @@ pub fn printStats(
     var vector_start_offset: usize = undefined;
     var newline_last: usize = undefined;
 
+    // collisions of indices into the hashmap
+    var hashmap_collisions: u64 = 0;
+    // collisions of actual hash value + len that requires full string check
+    var hash_collisions: u64 = 0;
+    
     while (file_reader.interface.fillMore()) {
         assert(file_reader.interface.seek == 0);
         newline_last = std.mem.findLast(u8, read_buffer[0..file_reader.interface.end], "\n") orelse unreachable;
@@ -150,6 +155,8 @@ pub fn printStats(
                 break :blk extract.top_hash == (name_hash >> 56) and extract.name_len == name.len and extract.buffer_index == 0;
             });
 
+            const og_index = hashmap_index;
+            
             while (@as(u32, @bitCast(hashmap[hashmap_index])) != 0) : (hashmap_index +%= 1) {
                 // TODO: check the assembly to make sure this just masks the value
                 if (@as(u32, @bitCast(hashmap[hashmap_index])) & 0xFFFF != expected_value) {
@@ -165,12 +172,16 @@ pub fn printStats(
                     stats_buffer[buffer_index].max = @max(stats_buffer[buffer_index].max, value);
                     break;
                 }
+                // did not ignore with initial check, so we ran full name compare but it failed
+                hash_collisions += 1;
             } else {
                 // no existing value, now at an open slot (zeroed)
                 hashmap[hashmap_index] = .{ .top_hash = @intCast(name_hash >> 56), .name_len = @intCast(name.len), .buffer_index = next_buffer_insert_index };
                 stats_buffer[next_buffer_insert_index] = .{ .count = 1, .sum = value, .min = value, .max = value };
                 @memcpy(name_buffer[next_buffer_insert_index][0..name.len], name);
                 next_buffer_insert_index += 1;
+                // only increment if we had to move to a different index (collision)
+                hashmap_collisions += @intFromBool(og_index != hashmap_index);
             }
         }
     } else |fill_err| switch (fill_err) {
@@ -179,6 +190,8 @@ pub fn printStats(
             return fill_err;
         },
     }
+
+    std.debug.print("hashmap collisions: {}, hash collisions: {}\n", .{hashmap_collisions, hash_collisions});
     
     try finalPrint(name_buffer[0..next_buffer_insert_index], stats_buffer[0..next_buffer_insert_index], writer);
 }
