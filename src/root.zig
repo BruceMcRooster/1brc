@@ -146,7 +146,8 @@ pub fn printStats(
                 break :read_value result;
             };
 
-            const name_hash = xorHash(name);
+            // drop semicolon to minimize hash collisions
+            const name_hash = xorHash(name[0..name.len-1]);
             comptime assert(std.math.isPowerOfTwo(hashmap_len));
             var hashmap_index: @Int(.unsigned, @ctz(hashmap_len)) = @intCast(name_hash % hashmap_len);
             const expected_value: u32 = @intCast(((name_hash >> 48) & 0xFF00) | @as(u8, @intCast(name.len)));
