@@ -51,7 +51,7 @@ pub fn printStats(
     @memset(hashmap, @bitCast(@as(u32, 0)));
     defer allocator.free(hashmap);
 
-    // plus one lets us use it as a temp buffer
+    // plus one lets us overread when hashing
     const name_buffer = try allocator.alignedAlloc([128]u8, .@"64", max_unique_station_count + 1);
     defer allocator.free(name_buffer);
     const stats_buffer = try allocator.alloc(StationStats, max_unique_station_count);
@@ -146,7 +146,7 @@ pub fn printStats(
                 break :read_value result;
             };
 
-            const name_hash = std.hash.XxHash3.hash(0xDEADB33F, name);
+            const name_hash = xorHash(name);
             comptime assert(std.math.isPowerOfTwo(hashmap_len));
             var hashmap_index: @Int(.unsigned, @ctz(hashmap_len)) = @intCast(name_hash % hashmap_len);
             const expected_value: u32 = @intCast(((name_hash >> 48) & 0xFF00) | @as(u8, @intCast(name.len)));
@@ -244,4 +244,30 @@ fn grabSemicolonBitmask(veclen: comptime_int, ptr: *const @Vector(veclen, u8)) @
     const vec: Vec = ptr.*;
     const semicolons: Int = @bitCast(vec == @as(Vec, @splat(';')));
     return semicolons;
+}
+
+fn xorHash(str: []const u8) u64 {
+    std.debug.print("Hashing: {s}\n", .{str});
+    const start_ptr: [*]align(1) const u64 = @ptrCast(str.ptr);
+    var bytes_to_keep_from_last_quad: u64 = @sizeOf(u64) - (str.len % @sizeOf(u64));
+    if (bytes_to_keep_from_last_quad == 0) bytes_to_keep_from_last_quad = @sizeOf(u64);
+    const last_mask: u64 = blk: {
+        const bytes_to_shift: u64 = @sizeOf(u64) - bytes_to_keep_from_last_quad;
+        const all_ones: u64 = ~@as(u64, 0);
+        break :blk all_ones >> @intCast(@bitSizeOf(u8) * bytes_to_shift);
+    };
+    std.debug.print("last_mask: {x}\n", .{last_mask});
+    if (str.len <= @sizeOf(u64)) return start_ptr[0] & last_mask;
+
+    var hash: u64 = start_ptr[0];
+
+    var curr_index: usize = 1;
+    // subtract 1 so that perfect multiples of 8 still get last quad kicked
+    // to else branch
+    while (curr_index < (str.len - 1) / 8) : (curr_index += 1) {
+        hash ^= start_ptr[curr_index];
+    } else {
+        hash ^= start_ptr[curr_index] & last_mask;
+    }
+    return hash;
 }
