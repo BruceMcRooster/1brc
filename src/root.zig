@@ -182,7 +182,7 @@ pub fn printStats(
                 @memcpy(name_buffer[next_buffer_insert_index][0..name.len], name);
                 next_buffer_insert_index += 1;
                 // only increment if we had to move to a different index (collision)
-                hashmap_collisions += @intFromBool(og_index != hashmap_index);
+                hashmap_collisions += hashmap_index - og_index;
             }
         }
     } else |fill_err| switch (fill_err) {
