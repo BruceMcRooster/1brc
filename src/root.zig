@@ -283,6 +283,5 @@ fn xorHash(str: []const u8) u64 {
         hash ^= elem1;
         hash ^= @byteSwap(elem2);
     }
-    // std.debug.print("hash: {x}\n", .{hash});
-    return hash;
+    return hash ^ (hash >> 33) ^ (hash >> 15);
 }
