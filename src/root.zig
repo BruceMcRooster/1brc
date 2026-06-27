@@ -148,7 +148,6 @@ pub fn printStats(
 
             // drop semicolon to minimize hash collisions
             const name_hash = xorHash(name[0..name.len-1]);
-            std.debug.print("{s} ({x}): ", .{name, name_hash});
             comptime assert(std.math.isPowerOfTwo(hashmap_len));
             var hashmap_index: @Int(.unsigned, @ctz(hashmap_len)) = @intCast(name_hash % hashmap_len);
             const expected_value: u32 = @intCast(((name_hash >> 48) & 0xFF00) | @as(u8, @intCast(name.len)));
@@ -162,12 +161,10 @@ pub fn printStats(
             while (@as(u32, @bitCast(hashmap[hashmap_index])) != 0) : (hashmap_index +%= 1) {
                 // TODO: check the assembly to make sure this just masks the value
                 if (@as(u32, @bitCast(hashmap[hashmap_index])) & 0xFFFF != expected_value) {
-                    std.debug.print("[{d}] -> ", .{hashmap_index});
                     continue;
                 }
                 // TODO: probably unroll this into definitely vectorized comparison, or check the assembly
                 if (std.mem.eql(u8, name, name_buffer[hashmap[hashmap_index].buffer_index][0..name.len])) {
-                    std.debug.print("*{d}*", .{hashmap_index});
                     // found existing value
                     const buffer_index = hashmap[hashmap_index].buffer_index;
                     stats_buffer[buffer_index].count += 1;
@@ -178,9 +175,7 @@ pub fn printStats(
                 }
                 // did not ignore with initial check, so we ran full name compare but it failed
                 hash_collisions += 1;
-                std.debug.print("{{{d}}} -> ", .{hashmap_index});
             } else {
-                std.debug.print("({d})", .{hashmap_index});
                 // no existing value, now at an open slot (zeroed)
                 hashmap[hashmap_index] = .{ .top_hash = @intCast(name_hash >> 56), .name_len = @intCast(name.len), .buffer_index = next_buffer_insert_index };
                 stats_buffer[next_buffer_insert_index] = .{ .count = 1, .sum = value, .min = value, .max = value };
@@ -189,7 +184,6 @@ pub fn printStats(
                 // only increment if we had to move to a different index (collision)
                 hashmap_collisions += hashmap_index - og_index;
             }
-            std.debug.print("\n", .{});
         }
     } else |fill_err| switch (fill_err) {
         error.EndOfStream => {},
@@ -254,34 +248,33 @@ fn grabSemicolonBitmask(veclen: comptime_int, ptr: *const @Vector(veclen, u8)) @
 }
 
 fn xorHash(str: []const u8) u64 {
-    // std.debug.print("Hashing: {s}, ", .{str});
-    const ptr_start: [*]align(1) const @Vector(2, u64) = @ptrCast(str.ptr);
-    var hash: u64 = 0;
-    // subtract 1 so that perfect multiples of 16 still get last quad kicked
-    // to else branch
-    const end_index = (str.len - 1) / 16;
+    const ptr_start: [*]align(1) const u64 = @ptrCast(str.ptr);
+    var hash: u64 = undefined;
 
-    // safe range because str.len >= 1 (so no underflow)
-    for (0..end_index) |i| {
-        const elem1, const elem2 = ptr_start[i];
-        hash ^= elem1;
-        hash ^= @byteSwap(elem2);
+    const end_mask = blk: {
+        const remaining_length = str.len % @sizeOf(u64);
+        // and to branchlessly fix the case where remaining_length = 0 (so we don't shift by the entire integer)
+        const shift = ((@sizeOf(u64) - remaining_length) & (@sizeOf(u64) - 1)) * @bitSizeOf(u8);
+        break :blk @as(u64, 0xFFFF_FFFF_FFFF_FFFF) >> @intCast(shift);
+    };
+    
+    if (str.len <= 16) {
+        @branchHint(.likely);
+        const is_gt_8_mask: u64 = @bitCast(@as(i64, @intFromBool(str.len > 8)) << 63 >> 63);
+        const quad_first = ptr_start[0] & (end_mask | is_gt_8_mask); // if str.len > 8, we just saturate and mask nothing
+        hash = quad_first;
+        const quad_second = ptr_start[1] & (end_mask & is_gt_8_mask); // if str.len <= 8, we mask any high bits
+        hash ^= quad_second;
     } else {
-        // this ends up being 0 if we have a full 16 bytes remaining, which we handle later
-        const remainder_len = str.len % 16;
-        const remainder_ptr: *align(1) const @Vector(16, u8) = @ptrCast(&ptr_start[end_index]);
-
-        const all_zeros: @Vector(16, u8) = @splat(0);
-
-        // masking to lowest bytes makes 16 (when remainder_len is 0) into 0, maintaining all others
-        const mask: u16 = @as(u16, 0xFFFF) >> @intCast(@as(usize, 16 - remainder_len) & 0xF);
-        // std.debug.print("mask: {b}, ", .{mask});
-        const remainder_masked = @select(u8, @as(@Vector(16, bool), @bitCast(mask)), remainder_ptr.*, all_zeros);
-        // std.debug.print("remainder_masked: {x}, ", .{remainder_masked});
-
-        const elem1, const elem2 = @as(@Vector(2, u64), @bitCast(remainder_masked));
-        hash ^= elem1;
-        hash ^= @byteSwap(elem2);
+        hash = ptr_start[0] ^ ptr_start[1];
+        const index_end = (str.len - 1) / @sizeOf(u64);
+        for (ptr_start[2..index_end]) |quad| {
+            hash ^= quad;
+        } else { // reached end
+            const quad_last = ptr_start[index_end] & end_mask;
+            hash ^= quad_last;
+        }
     }
+    
     return hash ^ (hash >> 33) ^ (hash >> 15);
 }
