@@ -40,23 +40,15 @@ pub fn printStats(
 
     // vibes-based length, should keep number of collisions low
     const hashmap_len = comptime std.math.ceilPowerOfTwo(usize, max_unique_station_count * 4) catch unreachable;
-    const hashmap = try allocator.alloc(
-        packed struct {
-            name_len: u8,
-            top_hash: u8,
-            buffer_index: u16,
-        },
-        hashmap_len,
-    );
-    @memset(hashmap, @bitCast(@as(u32, 0)));
-    defer allocator.free(hashmap);
 
-    // plus one lets us overread when hashing
-    const name_buffer = try allocator.alignedAlloc([128]u8, .@"64", max_unique_station_count + 1);
-    defer allocator.free(name_buffer);
-    const stats_buffer = try allocator.alloc(StationStats, max_unique_station_count);
-    defer allocator.free(stats_buffer);
-    var next_buffer_insert_index: u16 = 0;
+    const string_pool = try allocator.alloc(u8, max_unique_station_count * max_station_name_length);
+    defer allocator.free(string_pool);
+
+    var string_pool_buff_allocator = std.heap.FixedBufferAllocator.init(string_pool);
+    const string_pool_allocator = string_pool_buff_allocator.allocator();
+    
+    var hashmap: SwissTable = try .init(hashmap_len, allocator, string_pool_allocator);
+    defer hashmap.deinit(allocator);
 
     const veclen = std.simd.suggestVectorLength(u8) orelse 8; // orelse must fall back to at least 6
     comptime assert(veclen >= 6); // so that a float value (including newline) never crosses two boundaries
@@ -71,11 +63,6 @@ pub fn printStats(
     var semicolon_bitmask_curr: @Int(.unsigned, veclen) = undefined;
     var vector_start_offset: usize = undefined;
     var newline_last: usize = undefined;
-
-    // collisions of indices into the hashmap
-    var hashmap_collisions: u64 = 0;
-    // collisions of actual hash value + len that requires full string check
-    var hash_collisions: u64 = 0;
     
     while (file_reader.interface.fillMore()) {
         assert(file_reader.interface.seek == 0);
@@ -88,10 +75,10 @@ pub fn printStats(
                 vector_start_offset += veclen;
                 semicolon_bitmask_curr = grabSemicolonBitmask(veclen, @alignCast(@ptrCast(read_buffer.ptr + vector_start_offset)));
             }
-            const name: []u8 = read_buffer[file_reader.interface.seek..vector_start_offset + @ctz(semicolon_bitmask_curr) + 1]; // plus 1 for the ';'
+            const name: []u8 = read_buffer[file_reader.interface.seek..vector_start_offset + @ctz(semicolon_bitmask_curr)];
             semicolon_bitmask_curr ^= @as(@Int(.unsigned, veclen), 1) << @intCast(@ctz(semicolon_bitmask_curr));
 
-            file_reader.interface.toss(name.len);
+            file_reader.interface.toss(name.len + 1); // plus 1 for the ';'
 
             // credit to @merykitty for this implementation
             // and https://questdb.com/blog/billion-row-challenge-step-by-step/ for explaining
@@ -146,44 +133,7 @@ pub fn printStats(
                 break :read_value result;
             };
 
-            // drop semicolon to minimize hash collisions
-            const name_hash = xorHash(name[0..name.len-1]);
-            comptime assert(std.math.isPowerOfTwo(hashmap_len));
-            var hashmap_index: @Int(.unsigned, @ctz(hashmap_len)) = @intCast(name_hash % hashmap_len);
-            const expected_value: u32 = @intCast(((name_hash >> 48) & 0xFF00) | @as(u8, @intCast(name.len)));
-            assert(blk: {
-                const extract = @as(@typeInfo(@TypeOf(hashmap)).pointer.child, @bitCast(expected_value));
-                break :blk extract.top_hash == (name_hash >> 56) and extract.name_len == name.len and extract.buffer_index == 0;
-            });
-
-            const og_index = hashmap_index;
-            
-            while (@as(u32, @bitCast(hashmap[hashmap_index])) != 0) : (hashmap_index +%= 1) {
-                // TODO: check the assembly to make sure this just masks the value
-                if (@as(u32, @bitCast(hashmap[hashmap_index])) & 0xFFFF != expected_value) {
-                    continue;
-                }
-                // TODO: probably unroll this into definitely vectorized comparison, or check the assembly
-                if (stringEqualAssumingSafeOOB(name, name_buffer[hashmap[hashmap_index].buffer_index][0..name.len])) {
-                    // found existing value
-                    const buffer_index = hashmap[hashmap_index].buffer_index;
-                    stats_buffer[buffer_index].count += 1;
-                    stats_buffer[buffer_index].sum += value;
-                    stats_buffer[buffer_index].min = @min(stats_buffer[buffer_index].min, value);
-                    stats_buffer[buffer_index].max = @max(stats_buffer[buffer_index].max, value);
-                    break;
-                }
-                // did not ignore with initial check, so we ran full name compare but it failed
-                hash_collisions += 1;
-            } else {
-                // no existing value, now at an open slot (zeroed)
-                hashmap[hashmap_index] = .{ .top_hash = @intCast(name_hash >> 56), .name_len = @intCast(name.len), .buffer_index = next_buffer_insert_index };
-                stats_buffer[next_buffer_insert_index] = .{ .count = 1, .sum = value, .min = value, .max = value };
-                @memcpy(name_buffer[next_buffer_insert_index][0..name.len], name);
-                next_buffer_insert_index += 1;
-                // only increment if we had to move to a different index (collision)
-                hashmap_collisions += hashmap_index - og_index;
-            }
+            try hashmap.update(name, value);
         }
     } else |fill_err| switch (fill_err) {
         error.EndOfStream => {},
@@ -192,37 +142,48 @@ pub fn printStats(
         },
     }
 
-    std.debug.print("hashmap collisions: {}, hash collisions: {}\n", .{hashmap_collisions, hash_collisions});
-    
-    try finalPrint(name_buffer[0..next_buffer_insert_index], stats_buffer[0..next_buffer_insert_index], writer);
-}
+    std.debug.print("hash collisions: {}\n", .{hashmap.hash_collisions});
 
-inline fn finalPrint(name_buffer: [][128]u8, stats_buffer: []StationStats, writer: *Io.Writer) !void {
+    // plus 16 gives us a tiny amount of wiggle room that shouldn't be necessary just so we don't fail to slice 16 names forward
+    // in the hashtable extractAll function
+    const sorted_names_buffer = try allocator.alloc([]const u8, max_unique_station_count + 16);
+    const sorted_stats_buffer = try allocator.alloc(StationStats, max_unique_station_count + 16);
+    defer allocator.free(sorted_names_buffer);
+    defer allocator.free(sorted_stats_buffer);
+    const total_count = hashmap.extractAll(sorted_names_buffer, sorted_stats_buffer);
+    assert(total_count <= max_unique_station_count);
+    const sorted_names = sorted_names_buffer[0..total_count];
+    const sorted_stats = sorted_stats_buffer[0..total_count];
+
     const sort_context: struct {
-        name_buffer: [][128] u8,
+        name_buffer: [][]const u8,
         stats_buffer: []StationStats,
 
         pub fn swap(self: *const @This(), elem1: usize, elem2: usize) void {
-            std.mem.swap([128]u8, &self.name_buffer[elem1], &self.name_buffer[elem2]);
+            std.mem.swap([]const u8, &self.name_buffer[elem1], &self.name_buffer[elem2]);
             std.mem.swap(StationStats, &self.stats_buffer[elem1], &self.stats_buffer[elem2]);
         }
 
         pub fn lessThan(self: *const @This(), elem1: usize, elem2: usize) bool {
-            return stringCompareAssumingSafeOOB(&self.name_buffer[elem1], &self.name_buffer[elem2]) == .lt;
+            return stringCompareAssumingSafeOOB(self.name_buffer[elem1], self.name_buffer[elem2]) == .lt;
         }
     } = .{
-        .name_buffer = name_buffer,
-        .stats_buffer = stats_buffer,
+        .name_buffer = sorted_names,
+        .stats_buffer = sorted_stats,
     };
+
+    std.sort.heapContext(0, sorted_names.len, sort_context);
     
-    std.sort.heapContext(0, name_buffer.len, sort_context);
-    
+    try finalPrint(sorted_names, sorted_stats, writer);
+}
+
+inline fn finalPrint(sorted_names: [][]const u8, sorted_stats: []StationStats, writer: *Io.Writer) !void {    
     try writer.print("{{", .{});
-    for (name_buffer, 0..) |name, i| {
+    for (sorted_names, 0..) |name, i| {
         if (i > 0) try writer.print(", ", .{});
-                                            // need to slice at null terminator to avoid printing garbage
-        try writer.print("{s}=", .{std.mem.sliceTo(&name, ';')});
-        const stats = stats_buffer[i];
+
+        try writer.print("{s}=", .{name});
+        const stats = sorted_stats[i];
         const average = blk: {
             const partial_result = @divFloor(stats.sum * 10, @as(i64, @intCast(stats.count)));
             break :blk @divFloor(partial_result + 5, 10);
@@ -377,3 +338,109 @@ test "stringCompareAssumingSafeOOB" {
 
     try expect(stringCompareAssumingSafeOOB(a[0..equal_up_to], b[0..equal_up_to+1]) == .lt);
 }
+
+const SwissTable = struct {
+    const Metadata = packed struct {
+        name_hash_top: u7,
+        in_use: bool,
+
+        fn fromHash(hash: u64) @This() {
+            return @bitCast(
+                @as(@typeInfo(@This()).@"struct".backing_integer orelse unreachable, 
+                    @intCast(hash >> (@bitSizeOf(u64) - 7) | 0x80))
+            );
+        }
+    };
+    const Block = @Vector(16, @typeInfo(Metadata).@"struct".backing_integer orelse unreachable);
+
+    data: []Block,
+    names: [][]const u8,
+    stats: []StationStats,
+    name_allocator: std.mem.Allocator,
+    // for stats
+    hash_collisions: u64, // number of times a full string comparison is needed but comes back false
+
+    fn init(len: usize, allocator: std.mem.Allocator, name_allocator: std.mem.Allocator) !@This() {
+        const data = try allocator.alloc(Block, len);
+        @memset(data, @as(Block, @splat(0)));
+        
+        return .{
+            .data = data,
+            .names = try allocator.alloc([]const u8, len * 16),
+            .stats = try allocator.alloc(StationStats, len * 16),
+            .name_allocator = name_allocator,
+            .hash_collisions = 0,
+        };
+    }
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.names);
+        allocator.free(self.stats);
+        allocator.free(self.data);
+    }
+
+    fn update(self: *@This(), name: []const u8, temperature: i16) !void {
+        const hash = xorHash(name);
+        const metadata: Metadata = .fromHash(hash);
+        var block_index = hash % self.data.len;
+
+        while (true) {
+            var compare_result: u16 = @bitCast(self.data[block_index] == @as(Block, @splat(@bitCast(metadata))));
+            const first_zero: usize = @ctz(@as(u16, @bitCast(self.data[block_index] == @as(Block, @splat(0)))));
+
+            while (@ctz(compare_result) < first_zero) : (compare_result ^= @as(u16, 1) << @intCast(@ctz(compare_result))) {
+                const index = block_index * 16 + @ctz(compare_result);
+                if (stringEqualAssumingSafeOOB(name, self.names[index])) {
+                    @branchHint(.likely); // chances of collision are low, so very likely to be the same name
+                    self.stats[index].count += 1;
+                    self.stats[index].min = @min(self.stats[index].min, temperature);
+                    self.stats[index].max = @max(self.stats[index].max, temperature);
+                    self.stats[index].sum += temperature;
+                    return;
+                }
+                self.hash_collisions += 1;
+            } else {
+                // we don't find a match very infrequently,
+                // because most inserts will be to a table that has already been populated with names
+                @branchHint(.unlikely);
+                
+                if (first_zero < 16) {
+                    @branchHint(.likely); // this is the other case (the item isn't there yet)
+                    const index = block_index * 16 + first_zero;
+
+                    const new_name = try self.name_allocator.alloc(u8, name.len);
+                    @memcpy(new_name, name);
+                    self.names[index] = new_name;
+                    
+                    self.stats[index].count = 1;
+                    self.stats[index].min = temperature;
+                    self.stats[index].max = temperature;
+                    self.stats[index].sum = temperature;
+
+                    @as([*]u8, @ptrCast(&self.data[block_index]))[first_zero] = @bitCast(Metadata.fromHash(hash));
+                    return;
+                } else {
+                    // it is incredibly unlikely that an entire block is filled
+                    @branchHint(.cold);
+                    block_index = (block_index + 1) % self.data.len;
+                    assert(block_index != hash % self.data.len); // we should never reach the original target block
+                    continue;
+                }
+            }
+        }
+    }
+
+    fn extractAll(self: *const @This(), strings: [][]const u8, stats: []StationStats) usize {
+        var offset: usize = 0;
+        const empty_elem: Block = @splat(0);
+        
+        for (0..self.data.len) |block_index| {
+            @memcpy(strings[offset..offset+16], self.names[block_index * 16..].ptr);
+            @memcpy(stats[offset..offset+16], self.stats[block_index * 16..].ptr);
+            
+            const first_zero: usize = @ctz(@as(u16, @bitCast(self.data[block_index] == empty_elem)));
+            offset += first_zero;
+        }
+        return offset;
+    }
+};
