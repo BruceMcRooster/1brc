@@ -164,7 +164,7 @@ pub fn printStats(
                     continue;
                 }
                 // TODO: probably unroll this into definitely vectorized comparison, or check the assembly
-                if (std.mem.eql(u8, name, name_buffer[hashmap[hashmap_index].buffer_index][0..name.len])) {
+                if (stringEqualAssumingSafeOOB(name, name_buffer[hashmap[hashmap_index].buffer_index][0..name.len])) {
                     // found existing value
                     const buffer_index = hashmap[hashmap_index].buffer_index;
                     stats_buffer[buffer_index].count += 1;
@@ -208,7 +208,7 @@ inline fn finalPrint(name_buffer: [][128]u8, stats_buffer: []StationStats, write
         }
 
         pub fn lessThan(self: *const @This(), elem1: usize, elem2: usize) bool {
-            return std.mem.lessThan(u8, &self.name_buffer[elem1], &self.name_buffer[elem2]);
+            return stringCompareAssumingSafeOOB(&self.name_buffer[elem1], &self.name_buffer[elem2]) == .lt;
         }
     } = .{
         .name_buffer = name_buffer,
@@ -277,4 +277,103 @@ fn xorHash(str: []const u8) u64 {
     }
     
     return hash ^ (hash >> 33) ^ (hash >> 15);
+}
+
+// Assumes we can safely read up to one native vector length (std.simd.suggestVectorLength(u8))
+// past the end of the string to allow for faster comparisons
+fn stringEqualAssumingSafeOOB(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    const Vec = @Vector(std.simd.suggestVectorLength(u8) orelse 1, u8);
+
+    var i: usize = 0;
+    while (i < a.len & ~@as(usize, @sizeOf(Vec) - 1)) : (i += @sizeOf(Vec)) {
+        const a_vec: [*]align(1) const Vec = @ptrCast(a.ptr + i);
+        const b_vec: [*]align(1) const Vec = @ptrCast(b.ptr + i);
+        if (!@reduce(.And, a_vec[0] == b_vec[0])) return false;
+    }
+    const remainder = a.len % @sizeOf(Vec);
+    if (remainder != 0) { // we have a remainder
+        const a_vec: [*]align(1) const Vec = @ptrCast(a.ptr + i);
+        const b_vec: [*]align(1) const Vec = @ptrCast(b.ptr + i);
+        const unequal_bitmask: @Int(.unsigned, @sizeOf(Vec)) = @bitCast(a_vec[0] != b_vec[0]);
+        if (@ctz(unequal_bitmask) < remainder) return false;
+    }
+    return true;
+}
+
+fn stringCompareAssumingSafeOOB(a: []const u8, b: []const u8) std.math.Order {
+    const Vec = @Vector(std.simd.suggestVectorLength(u8) orelse 1, u8);
+
+    const min_len = @min(a.len, b.len);
+
+    var i: usize = 0;
+    while (i < min_len & ~@as(usize, @sizeOf(Vec) - 1)) : (i += @sizeOf(Vec)) {
+        const a_vec: [*]align(1) const Vec = @ptrCast(a.ptr + i);
+        const b_vec: [*]align(1) const Vec = @ptrCast(b.ptr + i);
+        const unequal_bitmask: @Int(.unsigned, @sizeOf(Vec)) = @bitCast(a_vec[0] != b_vec[0]);
+        if (unequal_bitmask != 0) {
+            return std.math.order(a[i + @ctz(unequal_bitmask)], b[i + @ctz(unequal_bitmask)]);
+        }
+    }
+    const remainder = a.len % @sizeOf(Vec);
+    if (remainder != 0) {
+        const a_vec: [*]align(1) const Vec = @ptrCast(a.ptr + i);
+        const b_vec: [*]align(1) const Vec = @ptrCast(b.ptr + i);
+        const unequal_bitmask: @Int(.unsigned, @sizeOf(Vec)) = @bitCast(a_vec[0] != b_vec[0]);
+        if (unequal_bitmask != 0 and @ctz(unequal_bitmask) < remainder) {
+            return std.math.order(a[i + @ctz(unequal_bitmask)], b[i + @ctz(unequal_bitmask)]);
+        }
+    }
+    return std.math.order(a.len, b.len);
+}
+
+test "stringEqualAssumingSafeOOB" {
+    const expect = std.testing.expect;
+
+    const pool = "hello world abcdefg. my very long string which is long!!my very long string which is longer. random padding I shouldn't use to make sure the vector can safely read past the end";
+    // large native len may mean out-of-bounds read in test, could need more padding
+    comptime assert(pool.len - 91 >= (std.simd.suggestVectorLength(u8) orelse 1));
+
+    try expect(stringEqualAssumingSafeOOB(pool[0..5], pool[0..5]));
+    try expect(!stringEqualAssumingSafeOOB(pool[0..5], pool[6..11]));
+    try expect(stringEqualAssumingSafeOOB(pool[12..18], pool[12..18]));
+    try expect(!stringEqualAssumingSafeOOB(pool[12..18], pool[12..19]));
+
+    const a = pool[21..56]; // my very...is long!!
+    const b = pool[56..91]; // my very...is longer
+    comptime assert(a.len == b.len); // need to actually test boundary condition
+
+    try expect(!stringEqualAssumingSafeOOB(a, b));
+
+    const equal_up_to = 33;
+    comptime assert(std.mem.eql(u8, a[0..equal_up_to], b[0..equal_up_to]));
+    comptime assert(!std.mem.eql(u8, a[0..equal_up_to+1], b[0..equal_up_to+1]));
+
+    try expect(stringEqualAssumingSafeOOB(a[0..equal_up_to], b[0..equal_up_to]));
+}
+
+test "stringCompareAssumingSafeOOB" {
+    const expect = std.testing.expect;
+
+    const pool = "hello world abcdefg. my very long string which is long!!my very long string which is longer. random padding I shouldn't use to make sure the vector can safely read past the end";
+    // large native len may mean out-of-bounds read in test, could need more padding
+    comptime assert(pool.len - 91 >= (std.simd.suggestVectorLength(u8) orelse 1));
+
+    try expect(stringCompareAssumingSafeOOB(pool[0..5], pool[0..5]) == .eq);
+    try expect(stringCompareAssumingSafeOOB(pool[0..5], pool[6..11]) == .lt);
+    try expect(stringCompareAssumingSafeOOB(pool[12..18], pool[12..18]) == .eq);
+    try expect(stringCompareAssumingSafeOOB(pool[12..18], pool[12..19]) == .lt);
+
+    const a = pool[21..56]; // my very...is long!!
+    const b = pool[56..91]; // my very...is longer
+
+    try expect(stringCompareAssumingSafeOOB(a, b) == .lt);
+
+    const equal_up_to = 33;
+    comptime assert(std.mem.eql(u8, a[0..equal_up_to], b[0..equal_up_to]));
+    comptime assert(!std.mem.eql(u8, a[0..equal_up_to+1], b[0..equal_up_to+1]));
+
+    try expect(stringCompareAssumingSafeOOB(a[0..equal_up_to], b[0..equal_up_to]) == .eq);
+
+    try expect(stringCompareAssumingSafeOOB(a[0..equal_up_to], b[0..equal_up_to+1]) == .lt);
 }
