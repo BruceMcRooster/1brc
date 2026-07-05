@@ -38,16 +38,13 @@ pub fn printStats(
 
     comptime assert(max_station_name_length <= 128);
 
-    // vibes-based length, should keep number of collisions low
-    const hashmap_len = comptime std.math.ceilPowerOfTwo(usize, max_unique_station_count * 4) catch unreachable;
-
     const string_pool = try allocator.alloc(u8, max_unique_station_count * max_station_name_length);
     defer allocator.free(string_pool);
 
     var string_pool_buff_allocator = std.heap.FixedBufferAllocator.init(string_pool);
     const string_pool_allocator = string_pool_buff_allocator.allocator();
     
-    var hashmap: SwissTable = try .init(hashmap_len, allocator, string_pool_allocator);
+    var hashmap: HashTable = try .init(allocator, string_pool_allocator);
     defer hashmap.deinit(allocator);
 
     const veclen = std.simd.suggestVectorLength(u8) orelse 8; // orelse must fall back to at least 6
@@ -144,46 +141,38 @@ pub fn printStats(
 
     std.debug.print("hash collisions: {}\n", .{hashmap.hash_collisions});
 
-    // plus 16 gives us a tiny amount of wiggle room that shouldn't be necessary just so we don't fail to slice 16 names forward
-    // in the hashtable extractAll function
-    const sorted_names_buffer = try allocator.alloc([]const u8, max_unique_station_count + 16);
-    const sorted_stats_buffer = try allocator.alloc(StationStats, max_unique_station_count + 16);
-    defer allocator.free(sorted_names_buffer);
-    defer allocator.free(sorted_stats_buffer);
-    const total_count = hashmap.extractAll(sorted_names_buffer, sorted_stats_buffer);
+    const sorted_data_buffer = try allocator.alloc(HashTable.Data, max_unique_station_count);
+    defer allocator.free(sorted_data_buffer);
+    const total_count = hashmap.extractAll(sorted_data_buffer);
     assert(total_count <= max_unique_station_count);
-    const sorted_names = sorted_names_buffer[0..total_count];
-    const sorted_stats = sorted_stats_buffer[0..total_count];
+    const sorted_data = sorted_data_buffer[0..total_count];
 
     const sort_context: struct {
-        name_buffer: [][]const u8,
-        stats_buffer: []StationStats,
+        data_buffer: []HashTable.Data,
 
         pub fn swap(self: *const @This(), elem1: usize, elem2: usize) void {
-            std.mem.swap([]const u8, &self.name_buffer[elem1], &self.name_buffer[elem2]);
-            std.mem.swap(StationStats, &self.stats_buffer[elem1], &self.stats_buffer[elem2]);
+            std.mem.swap(HashTable.Data, &self.data_buffer[elem1], &self.data_buffer[elem2]);
         }
 
         pub fn lessThan(self: *const @This(), elem1: usize, elem2: usize) bool {
-            return stringCompareAssumingSafeOOB(self.name_buffer[elem1], self.name_buffer[elem2]) == .lt;
+            return stringCompareAssumingSafeOOB(self.data_buffer[elem1].name, self.data_buffer[elem2].name) == .lt;
         }
     } = .{
-        .name_buffer = sorted_names,
-        .stats_buffer = sorted_stats,
+        .data_buffer = sorted_data,
     };
 
-    std.sort.heapContext(0, sorted_names.len, sort_context);
+    std.sort.heapContext(0, sorted_data.len, sort_context);
     
-    try finalPrint(sorted_names, sorted_stats, writer);
+    try finalPrint(sorted_data, writer);
 }
 
-inline fn finalPrint(sorted_names: [][]const u8, sorted_stats: []StationStats, writer: *Io.Writer) !void {    
+inline fn finalPrint(sorted_data: []HashTable.Data, writer: *Io.Writer) !void {    
     try writer.print("{{", .{});
-    for (sorted_names, 0..) |name, i| {
+    for (sorted_data, 0..) |data, i| {
         if (i > 0) try writer.print(", ", .{});
 
-        try writer.print("{s}=", .{name});
-        const stats = sorted_stats[i];
+        try writer.print("{s}=", .{data.name});
+        const stats = data.stats;
         const average = blk: {
             const partial_result = @divFloor(stats.sum * 10, @as(i64, @intCast(stats.count)));
             break :blk @divFloor(partial_result + 5, 10);
@@ -339,7 +328,7 @@ test "stringCompareAssumingSafeOOB" {
     try expect(stringCompareAssumingSafeOOB(a[0..equal_up_to], b[0..equal_up_to+1]) == .lt);
 }
 
-const SwissTable = struct {
+const HashTable = struct {
     const Metadata = packed struct {
         name_hash_top: u7,
         in_use: bool,
@@ -350,97 +339,110 @@ const SwissTable = struct {
                     @intCast(hash >> (@bitSizeOf(u64) - 7) | 0x80))
             );
         }
-    };
-    const Block = @Vector(16, @typeInfo(Metadata).@"struct".backing_integer orelse unreachable);
 
-    data: []Block,
-    names: [][]const u8,
-    stats: []StationStats,
+        fn empty() @This() {
+            return @bitCast(@as(@typeInfo(@This()).@"struct".backing_integer orelse unreachable, 0));
+        }
+    };
+    const Data = struct {
+        name: []const u8,
+        stats: StationStats,
+    };
+    const IndexInt = u16;
+    const ExtractVector = blk: {
+        const MetadataBackingInt = @typeInfo(Metadata).@"struct".backing_integer orelse unreachable;
+        const suggested_len = std.simd.suggestVectorLength(MetadataBackingInt) orelse 1;
+        const max_len = std.math.maxInt(MetadataBackingInt) + 1;
+        break :blk @Vector(@min(suggested_len, max_len), MetadataBackingInt);
+    };
+
+    meta: []Metadata,
+    data: []Data,
     name_allocator: std.mem.Allocator,
     // for stats
     hash_collisions: u64, // number of times a full string comparison is needed but comes back false
 
-    fn init(len: usize, allocator: std.mem.Allocator, name_allocator: std.mem.Allocator) !@This() {
-        const data = try allocator.alloc(Block, len);
-        @memset(data, @as(Block, @splat(0)));
+    fn init(allocator: std.mem.Allocator, name_allocator: std.mem.Allocator) !@This() {
+        const len = std.math.maxInt(IndexInt) + 1;
+        const meta = try allocator.alignedAlloc(Metadata, .fromByteUnits(@alignOf(ExtractVector)), len);
+        @memset(meta, .empty());
         
         return .{
-            .data = data,
-            .names = try allocator.alloc([]const u8, len * 16),
-            .stats = try allocator.alloc(StationStats, len * 16),
+            .meta = meta,
+            .data = try allocator.alloc(Data, len),
             .name_allocator = name_allocator,
             .hash_collisions = 0,
         };
     }
 
     fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-        allocator.free(self.names);
-        allocator.free(self.stats);
+        allocator.free(self.meta);
         allocator.free(self.data);
     }
 
     fn update(self: *@This(), name: []const u8, temperature: i16) !void {
         const hash = xorHash(name);
         const metadata: Metadata = .fromHash(hash);
-        var block_index = hash % self.data.len;
+        var index: IndexInt = @intCast(hash % self.data.len);
 
-        while (true) {
-            var compare_result: u16 = @bitCast(self.data[block_index] == @as(Block, @splat(@bitCast(metadata))));
-            const first_zero: usize = @ctz(@as(u16, @bitCast(self.data[block_index] == @as(Block, @splat(0)))));
-
-            while (@ctz(compare_result) < first_zero) : (compare_result ^= @as(u16, 1) << @intCast(@ctz(compare_result))) {
-                const index = block_index * 16 + @ctz(compare_result);
-                if (stringEqualAssumingSafeOOB(name, self.names[index])) {
-                    @branchHint(.likely); // chances of collision are low, so very likely to be the same name
-                    self.stats[index].count += 1;
-                    self.stats[index].min = @min(self.stats[index].min, temperature);
-                    self.stats[index].max = @max(self.stats[index].max, temperature);
-                    self.stats[index].sum += temperature;
-                    return;
-                }
-                self.hash_collisions += 1;
-            } else {
-                // we don't find a match very infrequently,
-                // because most inserts will be to a table that has already been populated with names
-                @branchHint(.unlikely);
+        while (true) : (index +%= 1) {
+            if (self.meta[index] == Metadata.empty()) {
+                const new_name = try self.name_allocator.alloc(u8, name.len);
+                @memcpy(new_name, name);
+                self.data[index].name = new_name;
                 
-                if (first_zero < 16) {
-                    @branchHint(.likely); // this is the other case (the item isn't there yet)
-                    const index = block_index * 16 + first_zero;
+                self.data[index].stats.count = 1;
+                self.data[index].stats.min = temperature;
+                self.data[index].stats.max = temperature;
+                self.data[index].stats.sum = temperature;
 
-                    const new_name = try self.name_allocator.alloc(u8, name.len);
-                    @memcpy(new_name, name);
-                    self.names[index] = new_name;
-                    
-                    self.stats[index].count = 1;
-                    self.stats[index].min = temperature;
-                    self.stats[index].max = temperature;
-                    self.stats[index].sum = temperature;
-
-                    @as([*]u8, @ptrCast(&self.data[block_index]))[first_zero] = @bitCast(Metadata.fromHash(hash));
-                    return;
-                } else {
-                    // it is incredibly unlikely that an entire block is filled
-                    @branchHint(.cold);
-                    block_index = (block_index + 1) % self.data.len;
-                    assert(block_index != hash % self.data.len); // we should never reach the original target block
-                    continue;
-                }
+                self.meta[index] = metadata;
+                return;
             }
+            if (self.meta[index] != metadata) {
+                @branchHint(.unlikely); // number of hash collisions stays pretty low
+                continue;
+            }
+
+            assert(self.meta[index] == metadata);
+            
+            if (stringEqualAssumingSafeOOB(name, self.data[index].name)) {
+                @branchHint(.likely); // chances of collision are low, so very likely to be the same name
+                self.data[index].stats.count += 1;
+                self.data[index].stats.min = @min(self.data[index].stats.min, temperature);
+                self.data[index].stats.max = @max(self.data[index].stats.max, temperature);
+                self.data[index].stats.sum += temperature;
+                return;
+            }
+            self.hash_collisions += 1;
         }
+
+        unreachable;
     }
 
-    fn extractAll(self: *const @This(), strings: [][]const u8, stats: []StationStats) usize {
-        var offset: usize = 0;
-        const empty_elem: Block = @splat(0);
-        
-        for (0..self.data.len) |block_index| {
-            @memcpy(strings[offset..offset+16], self.names[block_index * 16..].ptr);
-            @memcpy(stats[offset..offset+16], self.stats[block_index * 16..].ptr);
+    fn extractAll(self: *const @This(), dest: []Data) usize {
+        var curr_dest_offset: usize = 0;
+        const empty_elems: ExtractVector = @splat(0);
+        // working with clz instead of ctz because ordering doesn't matter and clz is faster on Mac (ctz not native)
+        const cmp_bit_at_top: @Int(.unsigned, @typeInfo(ExtractVector).vector.len) = @as(@Int(.unsigned, @typeInfo(ExtractVector).vector.len), 1) << (@typeInfo(ExtractVector).vector.len - 1);
+
+        var curr_ptr: [*]align(@alignOf(ExtractVector)) const Metadata = @ptrCast(@alignCast(self.meta.ptr));
+
+        while (curr_ptr != self.meta.ptr + self.meta.len) {
+            const curr_elems: ExtractVector = @as(*const ExtractVector, @ptrCast(curr_ptr)).*;
+            // add immediately so we can subtract leading 0s from it
+            curr_ptr += @typeInfo(ExtractVector).vector.len;
             
-            const first_zero: usize = @ctz(@as(u16, @bitCast(self.data[block_index] == empty_elem)));
-            offset += first_zero;
+            var cmp: @Int(.unsigned, @typeInfo(ExtractVector).vector.len) = @bitCast(curr_elems != empty_elems);
+            while (cmp != 0) : ({
+                cmp ^= cmp_bit_at_top >> @intCast(@clz(cmp));
+            }) {
+                const offset = @intFromPtr(curr_ptr - (@clz(cmp) + 1) - @intFromPtr(self.meta.ptr));
+                assert(self.meta[offset].in_use == true);
+                dest[curr_dest_offset] = self.data[offset];
+                curr_dest_offset += 1;
+            }
         }
-        return offset;
+        return curr_dest_offset;
     }
 };
