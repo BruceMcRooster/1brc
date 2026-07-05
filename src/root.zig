@@ -77,58 +77,7 @@ pub fn printStats(
 
             file_reader.interface.toss(name.len + 1); // plus 1 for the ';'
 
-            // credit to @merykitty for this implementation
-            // and https://questdb.com/blog/billion-row-challenge-step-by-step/ for explaining
-            const value: i16 = read_value: {
-                const value_ptr_start: *align(1) u64 = @ptrCast(read_buffer.ptr + file_reader.interface.seek);
-                const number_bytes = value_ptr_start.*;
-                const inv_number_bytes = ~number_bytes;
-            
-                // downcasting to u32 to get a u6 instead of a u7,
-                // because Zig wants a u6 for the shift by _28_minus_dot_pos later.
-                // totally safe because mask will remove any higher bits
-                const dot_pos: u6 = @ctz(@as(u32, @intCast(inv_number_bytes & 0x10101000)));
-                // micro-optimization: can save one instruction (xor 28 instead of mov 28, sub that other)
-                const _28_minus_dot_pos = dot_pos ^ 0b11100;
-                // inverse of '-' (0x2D) has 0x10 bit toggled, while any numbers (0x30–0x39) do not,
-                // so get a mask of all 1's if that is set in the first byte (it's a '-') or 0's otherwise
-                const signed: u64 = @bitCast(@as(i64, @bitCast(inv_number_bytes << 59)) >> 63);
-                const minus_filter = ~(signed & 0xFF);
-            
-                // extract the decimal values (0–9 is 0x30–0x39, so 0xF mask gets values)
-                // at the computed positions of each decimal
-                const digits = ((number_bytes & minus_filter) << _28_minus_dot_pos) & 0x0F000F0F00;
-            
-                // Multiplies each digit with the appropriate power of ten.
-                // Representing 0 as . for readability,
-                // 0x.......U...T.H.. * (100 * 0x1000000 + 10 * 0x10000 + 1) =
-                // 0x.U...T.H........ * 100 +
-                // 0x...U...T.H...... * 10 +
-                // 0x.......U...T.H..
-                //          ^--- H, T, and U are lined up here.
-                // This results in our temperature lying in bits 32 to 41 of this product.
-                const MAGIC_MULTIPLIER = (100 * 0x1000000 + 10 * 0x10000 + 1);
-                const abs_value = ((digits *% MAGIC_MULTIPLIER) >> 32) & 0x3FF;
-                // sign is either all 1's or all 0's, so this conditionally negates
-                const result = @as(i16, @truncate(@as(i64, @bitCast((abs_value +% signed) ^ signed))));
-
-                // advance the file reader past the value and newline
-                const prev_seek = file_reader.interface.seek;
-                file_reader.interface.toss(@intCast(
-                    -@as(i64, @bitCast(signed)) // possibly a negative sign
-                    + @intFromBool(abs_value > 99) // possibly a 10s place
-                    + 3 // x.x
-                    + 1 // \n
-                ));
-                assert(read_buffer[file_reader.interface.seek - 1] == '\n');
-                const multiple_of_veclen_mask = ~(@as(usize, veclen) - 1);
-                // detect if we crossed a vector boundary (can cross one at max)
-                assert(prev_seek & multiple_of_veclen_mask == file_reader.interface.seek & multiple_of_veclen_mask
-                    or semicolon_bitmask_curr == 0); // if we did cross a vector boundary, we should be out of existing semicolons
-                                                     // so that the iterator will increment the vector start offset and find a new one
-                    
-                break :read_value result;
-            };
+            const value: i16 = takeValue(&file_reader.interface);
 
             try hashmap.update(name, value);
         }
@@ -164,6 +113,51 @@ pub fn printStats(
     std.sort.heapContext(0, sorted_data.len, sort_context);
     
     try finalPrint(sorted_data, writer);
+}
+
+// credit to @merykitty for this implementation
+// and https://questdb.com/blog/billion-row-challenge-step-by-step/ for explaining
+inline fn takeValue(reader: *Io.Reader) i16 {
+    const value_ptr_start: *align(1) u64 = @ptrCast(reader.buffer.ptr + reader.seek);
+    const number_bytes = value_ptr_start.*;
+    const inv_number_bytes = ~number_bytes;
+
+    // downcasting to u32 to get a u6 instead of a u7,
+    // because Zig wants a u6 for the shift by _28_minus_dot_pos later.
+    // totally safe because mask will remove any higher bits
+    const dot_pos: u6 = @ctz(@as(u32, @intCast(inv_number_bytes & 0x10101000)));
+    // micro-optimization: can save one instruction (xor 28 instead of mov 28, sub that other)
+    const _28_minus_dot_pos = dot_pos ^ 0b11100;
+    // inverse of '-' (0x2D) has 0x10 bit toggled, while any numbers (0x30–0x39) do not,
+    // so get a mask of all 1's if that is set in the first byte (it's a '-') or 0's otherwise
+    const signed: u64 = @bitCast(@as(i64, @bitCast(inv_number_bytes << 59)) >> 63);
+    const minus_filter = ~(signed & 0xFF);
+
+    // extract the decimal values (0–9 is 0x30–0x39, so 0xF mask gets values)
+    // at the computed positions of each decimal
+    const digits = ((number_bytes & minus_filter) << _28_minus_dot_pos) & 0x0F000F0F00;
+
+    // Multiplies each digit with the appropriate power of ten.
+    // Representing 0 as . for readability,
+    // 0x.......U...T.H.. * (100 * 0x1000000 + 10 * 0x10000 + 1) =
+    // 0x.U...T.H........ * 100 +
+    // 0x...U...T.H...... * 10 +
+    // 0x.......U...T.H..
+    //          ^--- H, T, and U are lined up here.
+    // This results in our temperature lying in bits 32 to 41 of this product.
+    const MAGIC_MULTIPLIER = (100 * 0x1000000 + 10 * 0x10000 + 1);
+    const abs_value = ((digits *% MAGIC_MULTIPLIER) >> 32) & 0x3FF;
+    // sign is either all 1's or all 0's, so this conditionally negates
+    const result = @as(i16, @truncate(@as(i64, @bitCast((abs_value +% signed) ^ signed))));
+
+    // advance the file reader past the value and newline
+    reader.toss(@intCast(
+        -@as(i64, @bitCast(signed)) // possibly a negative sign
+        + @intFromBool(abs_value > 99) // possibly a 10s place
+        + 3 // x.x
+        + 1 // \n
+    ));
+    return result;
 }
 
 inline fn finalPrint(sorted_data: []HashTable.Data, writer: *Io.Writer) !void {    
