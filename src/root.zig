@@ -88,8 +88,6 @@ pub fn printStats(
         },
     }
 
-    std.debug.print("hash collisions: {}\n", .{hashmap.hash_collisions});
-
     const sorted_data_buffer = try allocator.alloc(HashTable.Data, max_unique_station_count);
     defer allocator.free(sorted_data_buffer);
     const total_count = hashmap.extractAll(sorted_data_buffer);
@@ -353,8 +351,6 @@ const HashTable = struct {
     meta: []Metadata,
     data: []Data,
     name_allocator: std.mem.Allocator,
-    // for stats
-    hash_collisions: u64, // number of times a full string comparison is needed but comes back false
 
     fn init(allocator: std.mem.Allocator, name_allocator: std.mem.Allocator) !@This() {
         const len = std.math.maxInt(IndexInt) + 1;
@@ -365,7 +361,6 @@ const HashTable = struct {
             .meta = meta,
             .data = try allocator.alloc(Data, len),
             .name_allocator = name_allocator,
-            .hash_collisions = 0,
         };
     }
 
@@ -408,7 +403,6 @@ const HashTable = struct {
                 self.data[index].stats.sum += temperature;
                 return;
             }
-            self.hash_collisions += 1;
         }
 
         unreachable;
