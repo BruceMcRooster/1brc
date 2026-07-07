@@ -24,6 +24,8 @@ const State = union(enum) {
     }
 };
 
+const read_veclen = std.simd.suggestVectorLength(u8) orelse 8; // orelse must fall back to at least 6
+
 /// Computes and prints the statistics for the given file to stdout,
 /// in the format specified by the challenge
 /// (`{Abha=-23.0/18.0/59.2, Abidjan=-16.2/26.0/67.3, ...}`).
@@ -47,40 +49,21 @@ pub fn printStats(
     var hashmap: HashTable = try .init(allocator, string_pool_allocator);
     defer hashmap.deinit(allocator);
 
-    const veclen = std.simd.suggestVectorLength(u8) orelse 8; // orelse must fall back to at least 6
-    comptime assert(veclen >= 6); // so that a float value (including newline) never crosses two boundaries
-    
     // align to vector reads
     // allocate a little extra to guarantee reads potentially past their known slices
-    const read_buffer = try allocator.alignedAlloc(u8, .fromByteUnits(veclen), 1024 * 1024 + 128);
+    const read_buffer = try allocator.alignedAlloc(u8, .fromByteUnits(read_veclen), 1024 * 1024 + 128);
     defer allocator.free(read_buffer);
 
     var file_reader = file.reader(io, read_buffer[0..(1024 * 1024)]);
     
-    var semicolon_bitmask_curr: @Int(.unsigned, veclen) = undefined;
-    var vector_start_offset: usize = undefined;
     var newline_last: usize = undefined;
     
     while (file_reader.interface.fillMore()) {
         assert(file_reader.interface.seek == 0);
         newline_last = std.mem.findLast(u8, read_buffer[0..file_reader.interface.end], "\n") orelse unreachable;
-        vector_start_offset = 0;
-        semicolon_bitmask_curr = grabSemicolonBitmask(veclen, @ptrCast(read_buffer.ptr));
 
-        while (file_reader.interface.seek < newline_last) {
-            while (semicolon_bitmask_curr == 0) {
-                vector_start_offset += veclen;
-                semicolon_bitmask_curr = grabSemicolonBitmask(veclen, @alignCast(@ptrCast(read_buffer.ptr + vector_start_offset)));
-            }
-            const name: []u8 = read_buffer[file_reader.interface.seek..vector_start_offset + @ctz(semicolon_bitmask_curr)];
-            semicolon_bitmask_curr ^= @as(@Int(.unsigned, veclen), 1) << @intCast(@ctz(semicolon_bitmask_curr));
-
-            file_reader.interface.toss(name.len + 1); // plus 1 for the ';'
-
-            const value: i16 = takeValue(&file_reader.interface);
-
-            try hashmap.update(name, value);
-        }
+        try extractValuesSafeOOB(read_buffer[0..newline_last + 1], &hashmap);
+        file_reader.interface.toss(newline_last + 1);
     } else |fill_err| switch (fill_err) {
         error.EndOfStream => {},
         else => {
@@ -113,10 +96,39 @@ pub fn printStats(
     try finalPrint(sorted_data, writer);
 }
 
+inline fn extractValuesSafeOOB(buffer: []const u8, hash_table: *HashTable) !void {
+    assert(buffer.len > 0 and buffer[buffer.len - 1] == '\n');
+    assert(@intFromPtr(buffer.ptr) % read_veclen == 0);
+
+    var offset: usize = 0;
+
+    var semicolon_bitmask_curr: @Int(.unsigned, read_veclen) = grabSemicolonBitmask(
+        read_veclen, @alignCast(@ptrCast(buffer.ptr)));
+    var vector_offset: usize = 0;
+
+    while (offset < buffer.len) {
+        while (semicolon_bitmask_curr == 0) {
+            vector_offset += read_veclen;
+            semicolon_bitmask_curr = grabSemicolonBitmask(read_veclen, @alignCast(@ptrCast(buffer.ptr + vector_offset)));
+        }
+        const name: []const u8 = buffer[offset..vector_offset + @ctz(semicolon_bitmask_curr)];
+        semicolon_bitmask_curr ^= @as(@Int(.unsigned, read_veclen), 1) << @intCast(@ctz(semicolon_bitmask_curr));
+
+        offset += name.len + 1; // plus 1 for the ';'
+
+        const result = extractValueSafeOOB(buffer[offset..]);
+        const value = result.val;
+        const char_count = result.char_count;
+        offset += char_count;
+
+        try hash_table.update(name, value);
+    }
+}
+
 // credit to @merykitty for this implementation
 // and https://questdb.com/blog/billion-row-challenge-step-by-step/ for explaining
-inline fn takeValue(reader: *Io.Reader) i16 {
-    const value_ptr_start: *align(1) u64 = @ptrCast(reader.buffer.ptr + reader.seek);
+inline fn extractValueSafeOOB(buffer: []const u8) struct { val: i16, char_count: usize } {
+    const value_ptr_start: *align(1) const u64 = @ptrCast(buffer.ptr);
     const number_bytes = value_ptr_start.*;
     const inv_number_bytes = ~number_bytes;
 
@@ -149,13 +161,13 @@ inline fn takeValue(reader: *Io.Reader) i16 {
     const result = @as(i16, @truncate(@as(i64, @bitCast((abs_value +% signed) ^ signed))));
 
     // advance the file reader past the value and newline
-    reader.toss(@intCast(
+    const char_count: usize = @intCast(
         -@as(i64, @bitCast(signed)) // possibly a negative sign
         + @intFromBool(abs_value > 99) // possibly a 10s place
         + 3 // x.x
         + 1 // \n
-    ));
-    return result;
+    );
+    return .{ .val = result, .char_count = char_count };
 }
 
 inline fn finalPrint(sorted_data: []HashTable.Data, writer: *Io.Writer) !void {    
