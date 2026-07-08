@@ -38,6 +38,24 @@ pub fn printStats(
     const file = try Io.Dir.openFile(Io.Dir.cwd(), io, file_name, .{ .mode = .read_only });
     defer file.close(io);
 
+    const stats = try file.stat(io);
+    const file_size = stats.size;
+    const good_size = blk: {
+        // values read a whole 64-bit int, but at minimum 4 of those bytes (x.x\n)
+        // are actually valid bits, so we only need to account for the overread
+        const max_value_overread = @sizeOf(u64) - 4;
+        const file_size_with_overread = file_size + max_value_overread;
+        const desired_to_be_multiple_of = stats.block_size;
+        const rounded_up = (file_size_with_overread + desired_to_be_multiple_of - 1) / desired_to_be_multiple_of * desired_to_be_multiple_of;
+        break :blk rounded_up;
+    };
+    var mmap = try file.createMemoryMap(io, .{ 
+        .len = good_size,
+        .protection = .{ .read = true, .write = false },
+    });
+    defer mmap.destroy(io);
+    try mmap.read(io);
+    
     comptime assert(max_station_name_length <= 128);
 
     const string_pool = try allocator.alloc(u8, max_unique_station_count * max_station_name_length);
@@ -49,27 +67,9 @@ pub fn printStats(
     var hashmap: HashTable = try .init(allocator, string_pool_allocator);
     defer hashmap.deinit(allocator);
 
-    // align to vector reads
-    // allocate a little extra to guarantee reads potentially past their known slices
-    const read_buffer = try allocator.alignedAlloc(u8, .fromByteUnits(read_veclen), 1024 * 1024 + 128);
-    defer allocator.free(read_buffer);
-
-    var file_reader = file.reader(io, read_buffer[0..(1024 * 1024)]);
+    const newline_last: usize = file_size;
     
-    var newline_last: usize = undefined;
-    
-    while (file_reader.interface.fillMore()) {
-        assert(file_reader.interface.seek == 0);
-        newline_last = std.mem.findLast(u8, read_buffer[0..file_reader.interface.end], "\n") orelse unreachable;
-
-        try extractValuesSafeOOB(read_buffer[0..newline_last + 1], &hashmap);
-        file_reader.interface.toss(newline_last + 1);
-    } else |fill_err| switch (fill_err) {
-        error.EndOfStream => {},
-        else => {
-            return fill_err;
-        },
-    }
+    try extractValuesSafeOOB(mmap.memory[0..newline_last], &hashmap);
 
     const sorted_data_buffer = try allocator.alloc(HashTable.Data, max_unique_station_count);
     defer allocator.free(sorted_data_buffer);
@@ -97,7 +97,6 @@ pub fn printStats(
 }
 
 inline fn extractValuesSafeOOB(buffer: []const u8, hash_table: *HashTable) !void {
-    assert(buffer.len > 0 and buffer[buffer.len - 1] == '\n');
     assert(@intFromPtr(buffer.ptr) % read_veclen == 0);
 
     var offset: usize = 0;
