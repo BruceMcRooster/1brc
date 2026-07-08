@@ -55,18 +55,12 @@ pub fn printStats(
     
     comptime assert(max_station_name_length <= 128);
 
-    const string_pool = try allocator.alloc(u8, max_unique_station_count * max_station_name_length);
-    defer allocator.free(string_pool);
-
-    var string_pool_buff_allocator = std.heap.FixedBufferAllocator.init(string_pool);
-    const string_pool_allocator = string_pool_buff_allocator.allocator();
-    
-    var hashmap: HashTable = try .init(allocator, string_pool_allocator);
+    var hashmap: HashTable = try .init(allocator);
     defer hashmap.deinit(allocator);
 
     const newline_last: usize = file_size;
     
-    try extractValuesSafeOOB(mmapped_buf[0..newline_last], &hashmap);
+    extractValuesSafeOOB(mmapped_buf[0..newline_last], &hashmap);
 
     const sorted_data_buffer = try allocator.alloc(HashTable.Data, max_unique_station_count);
     defer allocator.free(sorted_data_buffer);
@@ -93,7 +87,7 @@ pub fn printStats(
     try finalPrint(sorted_data, writer);
 }
 
-inline fn extractValuesSafeOOB(buffer: []const u8, hash_table: *HashTable) !void {
+inline fn extractValuesSafeOOB(buffer: []const u8, hash_table: *HashTable) void {
     assert(@intFromPtr(buffer.ptr) % read_veclen == 0);
 
     var offset: usize = 0;
@@ -117,7 +111,7 @@ inline fn extractValuesSafeOOB(buffer: []const u8, hash_table: *HashTable) !void
         const char_count = result.char_count;
         offset += char_count;
 
-        try hash_table.update(name, value);
+        hash_table.update(name, value);
     }
 }
 
@@ -358,9 +352,8 @@ const HashTable = struct {
 
     meta: []Metadata,
     data: []Data,
-    name_allocator: std.mem.Allocator,
 
-    fn init(allocator: std.mem.Allocator, name_allocator: std.mem.Allocator) !@This() {
+    fn init(allocator: std.mem.Allocator) !@This() {
         const len = std.math.maxInt(IndexInt) + 1;
         const meta = try allocator.alignedAlloc(Metadata, .fromByteUnits(@alignOf(ExtractVector)), len);
         @memset(meta, .empty());
@@ -368,7 +361,6 @@ const HashTable = struct {
         return .{
             .meta = meta,
             .data = try allocator.alloc(Data, len),
-            .name_allocator = name_allocator,
         };
     }
 
@@ -377,16 +369,14 @@ const HashTable = struct {
         allocator.free(self.data);
     }
 
-    fn update(self: *@This(), name: []const u8, temperature: i16) !void {
+    fn update(self: *@This(), name: []const u8, temperature: i16) void {
         const hash = xorHash(name);
         const metadata: Metadata = .fromHash(hash);
         var index: IndexInt = @intCast(hash % self.data.len);
 
         while (true) : (index +%= 1) {
             if (self.meta[index] == Metadata.empty()) {
-                const new_name = try self.name_allocator.alloc(u8, name.len);
-                @memcpy(new_name, name);
-                self.data[index].name = new_name;
+                self.data[index].name = name;
                 
                 self.data[index].stats.count = 1;
                 self.data[index].stats.min = temperature;
