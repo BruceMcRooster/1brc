@@ -49,12 +49,9 @@ pub fn printStats(
         const rounded_up = (file_size_with_overread + desired_to_be_multiple_of - 1) / desired_to_be_multiple_of * desired_to_be_multiple_of;
         break :blk rounded_up;
     };
-    var mmap = try file.createMemoryMap(io, .{ 
-        .len = good_size,
-        .protection = .{ .read = true, .write = false },
-    });
-    defer mmap.destroy(io);
-    try mmap.read(io);
+    const mmapped_buf = try std.posix.mmap(null, good_size, .{ .READ = true, .WRITE = false }, .{ .TYPE = .PRIVATE }, file.handle, 0);
+    try std.posix.madvise(mmapped_buf.ptr, mmapped_buf.len, std.c.MADV.SEQUENTIAL);
+    defer std.posix.munmap(mmapped_buf);
     
     comptime assert(max_station_name_length <= 128);
 
@@ -69,7 +66,7 @@ pub fn printStats(
 
     const newline_last: usize = file_size;
     
-    try extractValuesSafeOOB(mmap.memory[0..newline_last], &hashmap);
+    try extractValuesSafeOOB(mmapped_buf[0..newline_last], &hashmap);
 
     const sorted_data_buffer = try allocator.alloc(HashTable.Data, max_unique_station_count);
     defer allocator.free(sorted_data_buffer);
