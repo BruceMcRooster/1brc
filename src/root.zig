@@ -50,8 +50,9 @@ pub fn printStats(
         break :blk rounded_up;
     };
     const mmapped_buf = try std.posix.mmap(null, good_size, .{ .READ = true, .WRITE = false }, .{ .TYPE = .PRIVATE }, file.handle, 0);
-    try std.posix.madvise(mmapped_buf.ptr, mmapped_buf.len, std.c.MADV.SEQUENTIAL);
     defer std.posix.munmap(mmapped_buf);
+
+    const madvise_size = 64 * (1 << 20);
     
     comptime assert(max_station_name_length <= 128);
 
@@ -66,7 +67,7 @@ pub fn printStats(
 
     const newline_last: usize = file_size;
     
-    try extractValuesSafeOOB(mmapped_buf[0..newline_last], &hashmap);
+    try extractValuesSafeOOB(mmapped_buf[0..newline_last], &hashmap, madvise_size);
 
     const sorted_data_buffer = try allocator.alloc(HashTable.Data, max_unique_station_count);
     defer allocator.free(sorted_data_buffer);
@@ -93,8 +94,20 @@ pub fn printStats(
     try finalPrint(sorted_data, writer);
 }
 
-inline fn extractValuesSafeOOB(buffer: []const u8, hash_table: *HashTable) !void {
+inline fn extractValuesSafeOOB(
+    buffer: []const u8,
+    hash_table: *HashTable,
+    madvise_size: usize
+) !void {
     assert(@intFromPtr(buffer.ptr) % read_veclen == 0);
+    assert(std.math.isPowerOfTwo(madvise_size));
+    
+    try std.posix.madvise(
+        @constCast(@alignCast(buffer.ptr)),
+        if (buffer.len <= 2 * madvise_size) buffer.len else 2 * madvise_size,
+        std.posix.MADV.WILLNEED
+    );
+    std.debug.print("init madvise({*}, {d}, WILLNEED)\n", .{ buffer.ptr, if (buffer.len <= 2 * madvise_size) buffer.len else 2 * madvise_size });
 
     var offset: usize = 0;
 
@@ -110,12 +123,29 @@ inline fn extractValuesSafeOOB(buffer: []const u8, hash_table: *HashTable) !void
         const name: []const u8 = buffer[offset..vector_offset + @ctz(semicolon_bitmask_curr)];
         semicolon_bitmask_curr ^= @as(@Int(.unsigned, read_veclen), 1) << @intCast(@ctz(semicolon_bitmask_curr));
 
+        const prev_offset = offset;
+        
         offset += name.len + 1; // plus 1 for the ';'
 
         const result = extractValueSafeOOB(buffer[offset..]);
         const value = result.val;
         const char_count = result.char_count;
         offset += char_count;
+
+        const offset_floor = offset & ~(madvise_size - 1);
+        if (offset_floor != prev_offset & ~(madvise_size - 1)) {
+            // we crossed an madvise_size boundary, so need advise we'll need the next one
+            const next_start = offset_floor + madvise_size;
+            const next_end = @min(next_start + madvise_size, buffer.len);
+            if (next_start < next_end) {
+                try std.posix.madvise(
+                    @constCast(@alignCast(buffer.ptr + next_start)),
+                    next_end - next_start,
+                    std.posix.MADV.WILLNEED
+                );
+                std.debug.print("madvise({*}, {d}, WILLNEED)\n", .{ buffer.ptr + next_start, next_end - next_start });
+            }
+        }
 
         try hash_table.update(name, value);
     }
