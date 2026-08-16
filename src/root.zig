@@ -56,24 +56,39 @@ pub fn printStats(
     
     comptime assert(max_station_name_length <= 128);
 
-    const string_pool = try allocator.alloc(u8, max_unique_station_count * max_station_name_length);
+    const sorted_data_buffer = try allocator.alloc(HashTable.Data, max_unique_station_count);
+    defer allocator.free(sorted_data_buffer);
+    // this will have its length mutated to the correct length,
+    // but we need to keep the original around to free the right length
+    var sorted_data = sorted_data_buffer;
+
+    const string_pool = try fullProcess(mmapped_buf[0..file_size], &sorted_data, madvise_size, allocator);
     defer allocator.free(string_pool);
+
+    var wrapped: [1][]HashTable.Data = .{sorted_data};
+    try mergeAndPrintData(&wrapped, writer);
+}
+
+fn fullProcess(
+    buffer: []const u8,
+    output: *[]HashTable.Data,
+    madvise_size: usize,
+    allocator: std.mem.Allocator,
+) ![]u8 {
+    const string_pool = try allocator.alloc(u8, max_unique_station_count * max_station_name_length);
 
     var string_pool_buff_allocator = std.heap.FixedBufferAllocator.init(string_pool);
     const string_pool_allocator = string_pool_buff_allocator.allocator();
     
     var hashmap: HashTable = try .init(allocator, string_pool_allocator);
     defer hashmap.deinit(allocator);
-
-    const newline_last: usize = file_size;
     
-    try extractValuesSafeOOB(mmapped_buf[0..newline_last], &hashmap, madvise_size);
+    try extractValuesSafeOOB(buffer, &hashmap, madvise_size);
 
-    const sorted_data_buffer = try allocator.alloc(HashTable.Data, max_unique_station_count);
-    defer allocator.free(sorted_data_buffer);
-    const total_count = hashmap.extractAll(sorted_data_buffer);
+    const total_count = hashmap.extractAll(output.*);
     assert(total_count <= max_unique_station_count);
-    const sorted_data = sorted_data_buffer[0..total_count];
+    output.len = total_count;
+    const sorted_data = output.*;
 
     const sort_context: struct {
         data_buffer: []HashTable.Data,
