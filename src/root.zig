@@ -90,8 +90,9 @@ pub fn printStats(
     };
 
     std.sort.heapContext(0, sorted_data.len, sort_context);
-    
-    try finalPrint(sorted_data, writer);
+
+    var wrapped: [1][]HashTable.Data = .{sorted_data};
+    try mergeAndPrintData(&wrapped, writer);
 }
 
 inline fn extractValuesSafeOOB(
@@ -107,7 +108,6 @@ inline fn extractValuesSafeOOB(
         if (buffer.len <= 2 * madvise_size) buffer.len else 2 * madvise_size,
         std.posix.MADV.WILLNEED
     );
-    std.debug.print("init madvise({*}, {d}, WILLNEED)\n", .{ buffer.ptr, if (buffer.len <= 2 * madvise_size) buffer.len else 2 * madvise_size });
 
     var offset: usize = 0;
 
@@ -143,7 +143,6 @@ inline fn extractValuesSafeOOB(
                     next_end - next_start,
                     std.posix.MADV.WILLNEED
                 );
-                std.debug.print("madvise({*}, {d}, WILLNEED)\n", .{ buffer.ptr + next_start, next_end - next_start });
             }
         }
 
@@ -194,29 +193,6 @@ inline fn extractValueSafeOOB(buffer: []const u8) struct { val: i16, char_count:
         + 1 // \n
     );
     return .{ .val = result, .char_count = char_count };
-}
-
-inline fn finalPrint(sorted_data: []HashTable.Data, writer: *Io.Writer) !void {    
-    try writer.print("{{", .{});
-    for (sorted_data, 0..) |data, i| {
-        if (i > 0) try writer.print(", ", .{});
-
-        try writer.print("{s}=", .{data.name});
-        const stats = data.stats;
-        const average = blk: {
-            const partial_result = @divFloor(stats.sum * 10, @as(i64, @intCast(stats.count)));
-            break :blk @divFloor(partial_result + 5, 10);
-        };
-        try writer.print(
-            "{s}{d}.{d}/{s}{d}.{d}/{s}{d}.{d}",
-            .{
-                if (stats.min < 0) "-" else "", @abs(@divTrunc(stats.min, 10)), @abs(@rem(stats.min, 10)),
-                if (average < 0) "-" else "", @abs(@divTrunc(average, 10)), @abs(@rem(average, 10)),
-                if (stats.max < 0) "-" else "", @abs(@divTrunc(stats.max, 10)), @abs(@rem(stats.max, 10))}
-        );
-    }
-    try writer.print("}}\n", .{});
-    try writer.flush();
 }
 
 fn grabSemicolonBitmask(veclen: comptime_int, ptr: *const @Vector(veclen, u8)) @Int(.unsigned, veclen) {
@@ -472,3 +448,61 @@ const HashTable = struct {
         return curr_dest_offset;
     }
 };
+
+fn mergeAndPrintData(
+    data: [][]HashTable.Data,
+    writer: *Io.Writer
+) !void {
+    assert(data.len > 0);
+
+    try writer.print("{{", .{});
+
+    var first_loop = true;
+    mainloop: while (true) {
+        var best_index: usize = 0;
+        while (data[best_index].len == 0) {
+            best_index += 1;
+            if (best_index == data.len) break :mainloop;
+        }
+        assert(data[best_index].len > 0);
+
+        for (data[1..], 1..) |data_list, i| {
+            if (data_list.len == 0) continue;
+            const cmp = stringCompareAssumingSafeOOB(data_list[0].name, data[best_index][0].name);
+            if (cmp == .lt) {
+                best_index = i;
+            } else if (cmp == .eq) {
+                const stats_a = data[best_index][0].stats;
+                const stats_b = data[i][0].stats;
+                data[best_index][0].stats = .{
+                    .min = @min(stats_a.min, stats_b.min),
+                    .max = @max(stats_a.max, stats_b.max),
+                    .sum = stats_a.sum + stats_b.sum,
+                    .count = stats_a.count + stats_b.count,
+                };
+                data[i] = data[i][1..];
+            }
+        }
+
+        if (!first_loop) try writer.print(", ", .{});
+        first_loop = false;
+
+        try writer.print("{s}=", .{data[best_index][0].name});
+        const stats = data[best_index][0].stats;
+        const average = blk: {
+            const partial_result = @divFloor(stats.sum * 10, @as(i64, @intCast(stats.count)));
+            break :blk @divFloor(partial_result + 5, 10);
+        };
+        try writer.print(
+            "{s}{d}.{d}/{s}{d}.{d}/{s}{d}.{d}",
+            .{
+                if (stats.min < 0) "-" else "", @abs(@divTrunc(stats.min, 10)), @abs(@rem(stats.min, 10)),
+                if (average < 0) "-" else "", @abs(@divTrunc(average, 10)), @abs(@rem(average, 10)),
+                if (stats.max < 0) "-" else "", @abs(@divTrunc(stats.max, 10)), @abs(@rem(stats.max, 10))}
+        );
+
+        data[best_index] = data[best_index][1..];
+    }
+    try writer.print("}}\n", .{});
+    try writer.flush();
+}
