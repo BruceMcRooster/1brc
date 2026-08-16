@@ -14,16 +14,6 @@ const StationStats = struct {
     count: u32
 };
 
-const State = union(enum) {
-    reading_name: void,
-    reading_value: struct {
-        stats: *StationStats,
-        // whether we should just updated the stats
-        // instead of overwriting them with our new values (because there were no stats)
-        do_update: bool
-    }
-};
-
 const read_veclen = std.simd.suggestVectorLength(u8) orelse 8; // orelse must fall back to at least 6
 
 /// Computes and prints the statistics for the given file to stdout,
