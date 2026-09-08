@@ -96,8 +96,8 @@ fn fullProcess(
 
     std.sort.heapContext(0, sorted_data.len, sort_context);
 
-    var wrapped: [1][]HashTable.Data = .{sorted_data};
-    try mergeAndPrintData(&wrapped, writer);
+    // allows caller to free when done
+    return string_pool;
 }
 
 inline fn extractValuesSafeOOB(
