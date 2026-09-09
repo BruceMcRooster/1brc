@@ -16,7 +16,7 @@ const StationStats = struct {
 
 const read_veclen = std.simd.suggestVectorLength(u8) orelse 8; // orelse must fall back to at least 6
 const madvise_size: usize = 64 * (1 << 20);
-const num_workers = 4;
+const num_workers = 8;
 
 const WorkerConfig = struct {
     io: Io,
