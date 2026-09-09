@@ -340,7 +340,7 @@ fn stringCompareAssumingSafeOOB(a: []const u8, b: []const u8) std.math.Order {
             return std.math.order(a[i + @ctz(unequal_bitmask)], b[i + @ctz(unequal_bitmask)]);
         }
     }
-    const remainder = a.len % @sizeOf(Vec);
+    const remainder = min_len % @sizeOf(Vec);
     if (remainder != 0) {
         const a_vec: [*]align(1) const Vec = @ptrCast(a.ptr + i);
         const b_vec: [*]align(1) const Vec = @ptrCast(b.ptr + i);
@@ -401,6 +401,33 @@ test "stringCompareAssumingSafeOOB" {
     try expect(stringCompareAssumingSafeOOB(a[0..equal_up_to], b[0..equal_up_to]) == .eq);
 
     try expect(stringCompareAssumingSafeOOB(a[0..equal_up_to], b[0..equal_up_to+1]) == .lt);
+}
+
+test "stringCompareAssumingSafeOOB: shared-prefix length aligned to vector width" {
+    const expect = std.testing.expect;
+    const Vec = @Vector(std.simd.suggestVectorLength(u8) orelse 1, u8);
+    const vlen = @sizeOf(Vec);
+
+    var buf: [256]u8 = undefined;
+    @memset(&buf, 'z'); // padding/garbage that must NOT influence the result
+
+    // "long" = vlen 'a's followed by one 'b', i.e. long.len == vlen + 1.
+    for (0..vlen) |i| buf[i] = 'a';
+    buf[vlen] = 'b';
+    const long = buf[0 .. vlen + 1];
+
+    // "short" is placed elsewhere in the buffer: exactly vlen 'a's (matching long's
+    // shared prefix exactly), i.e. short.len == vlen, a length that's an exact
+    // multiple of the vector width. Whatever sits right after `short` in memory
+    // (here: 'z', deliberately > 'b') must be ignored -- since short is entirely
+    // a prefix of long, short must always compare as .lt (and long as .gt)
+    // regardless of that padding.
+    const short_start = 2 * vlen;
+    for (short_start..short_start + vlen) |i| buf[i] = 'a';
+    const short = buf[short_start .. short_start + vlen];
+
+    try expect(stringCompareAssumingSafeOOB(short, long) == .lt);
+    try expect(stringCompareAssumingSafeOOB(long, short) == .gt);
 }
 
 const HashTable = struct {
