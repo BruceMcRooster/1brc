@@ -15,6 +15,43 @@ const StationStats = struct {
 };
 
 const read_veclen = std.simd.suggestVectorLength(u8) orelse 8; // orelse must fall back to at least 6
+const madvise_size: usize = 64 * (1 << 20);
+const num_workers = 4;
+
+const WorkerConfig = struct {
+    io: Io,
+    hashtable: HashTable,
+    sorted_output_destination: []HashTable.Data,
+    parse_buffer: []const u8,
+    _string_pool_allocator: *std.heap.FixedBufferAllocator,
+
+    fn init(io: Io, parse_buffer: []const u8, allocator: std.mem.Allocator) !@This() {
+        const string_pool = try allocator.alloc(u8, (max_unique_station_count + 1) * max_station_name_length);
+        const string_pool_allocator = try allocator.create(std.heap.FixedBufferAllocator);
+        string_pool_allocator.* = std.heap.FixedBufferAllocator.init(string_pool);
+        const hashtable = try HashTable.init(allocator, string_pool_allocator.allocator());
+
+        const sorted_output_destination = try allocator.alloc(HashTable.Data, max_unique_station_count);
+
+        return .{
+            .io = io,
+            .hashtable = hashtable,
+            .sorted_output_destination = sorted_output_destination,
+            .parse_buffer = parse_buffer,
+            ._string_pool_allocator = string_pool_allocator,
+        };
+    }
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        self.hashtable.deinit(allocator);
+        allocator.free(self._string_pool_allocator.buffer);
+        allocator.destroy(self._string_pool_allocator);
+        // reset because it will have been changed to reflect the actual count,
+        // but must be freed at the originally allocated size
+        self.sorted_output_destination.len = max_unique_station_count;
+        allocator.free(self.sorted_output_destination);
+    }
+};
 
 /// Computes and prints the statistics for the given file to stdout,
 /// in the format specified by the challenge
@@ -42,43 +79,64 @@ pub fn printStats(
     const mmapped_buf = try std.posix.mmap(null, good_size, .{ .READ = true, .WRITE = false }, .{ .TYPE = .PRIVATE }, file.handle, 0);
     defer std.posix.munmap(mmapped_buf);
 
-    const madvise_size = 64 * (1 << 20);
-    
     comptime assert(max_station_name_length <= 128);
 
-    const sorted_data_buffer = try allocator.alloc(HashTable.Data, max_unique_station_count);
-    defer allocator.free(sorted_data_buffer);
-    // this will have its length mutated to the correct length,
-    // but we need to keep the original around to free the right length
-    var sorted_data = sorted_data_buffer;
+    // should be the index one past a newline
+    var split_points: [num_workers + 1]usize = undefined;
+    split_points[0] = 0;
+    split_points[split_points.len - 1] = stats.size;
+    for (split_points[1..num_workers], 1..) |*split_point, i| {
+        const ideal = file_size / num_workers * i;
+        const floored_to_page = ideal - (ideal % std.heap.pageSize());
+        
+        std.posix.madvise(
+            @alignCast(mmapped_buf.ptr[floored_to_page..]),
+            max_station_name_length,
+            std.posix.MADV.WILLNEED
+        ) catch unreachable;
 
-    const string_pool = try fullProcess(mmapped_buf[0..file_size], &sorted_data, madvise_size, allocator);
-    defer allocator.free(string_pool);
+        const line_end = std.mem.findScalarPos(u8, mmapped_buf, floored_to_page, '\n') orelse unreachable;
+        split_point.* = line_end + 1;
+    }
+    
+    var config: [num_workers]WorkerConfig = undefined;
+    for (&config, 0..) |*worker_config, i| {
+        worker_config.* = try WorkerConfig.init(
+            io,
+            mmapped_buf[split_points[i]..split_points[i+1]],
+            allocator
+        );
+    }
+    defer {
+        for (&config) |*worker_config| {
+            worker_config.deinit(allocator);
+        }
+    }
 
-    var wrapped: [1][]HashTable.Data = .{sorted_data};
+    var group: Io.Group = .init;
+    for (&config) |*worker_config| {
+        group.async(io, fullProcess, .{worker_config});
+    }
+
+    try group.await(io);
+    
+    var wrapped: [num_workers][]HashTable.Data = undefined;
+    for (&wrapped, 0..) |*wrapped_slice, i| {
+        wrapped_slice.* = config[i].sorted_output_destination;
+    }
+    
     try mergeAndPrintData(&wrapped, writer);
 }
 
 fn fullProcess(
-    buffer: []const u8,
-    output: *[]HashTable.Data,
-    madvise_size: usize,
-    allocator: std.mem.Allocator,
-) ![]u8 {
-    const string_pool = try allocator.alloc(u8, max_unique_station_count * max_station_name_length);
+    config: *WorkerConfig,
+) void {
+    extractValuesSafeOOB(config.parse_buffer, &config.hashtable);
 
-    var string_pool_buff_allocator = std.heap.FixedBufferAllocator.init(string_pool);
-    const string_pool_allocator = string_pool_buff_allocator.allocator();
-    
-    var hashmap: HashTable = try .init(allocator, string_pool_allocator);
-    defer hashmap.deinit(allocator);
-    
-    try extractValuesSafeOOB(buffer, &hashmap, madvise_size);
-
-    const total_count = hashmap.extractAll(output.*);
+    const total_count = config.hashtable.extractAll(config.sorted_output_destination);
     assert(total_count <= max_unique_station_count);
-    output.len = total_count;
-    const sorted_data = output.*;
+    config.sorted_output_destination.len = total_count;
+    const sorted_data = config.sorted_output_destination;
 
     const sort_context: struct {
         data_buffer: []HashTable.Data,
@@ -95,30 +153,36 @@ fn fullProcess(
     };
 
     std.sort.heapContext(0, sorted_data.len, sort_context);
-
-    // allows caller to free when done
-    return string_pool;
 }
 
 inline fn extractValuesSafeOOB(
-    buffer: []const u8,
+    assigned_buffer: []const u8,
     hash_table: *HashTable,
-    madvise_size: usize
-) !void {
-    assert(@intFromPtr(buffer.ptr) % read_veclen == 0);
-    assert(std.math.isPowerOfTwo(madvise_size));
+) void {
+    var offset: usize = 0;
+
+    const buffer: []const u8 = blk: {
+        const aligned_start: [*]const u8 = @ptrFromInt(@intFromPtr(assigned_buffer.ptr) - (@intFromPtr(assigned_buffer.ptr) % read_veclen));
+        const total_length = (assigned_buffer.ptr - aligned_start) + assigned_buffer.len;
+        break :blk aligned_start[0..total_length];
+    };
     
-    try std.posix.madvise(
+    std.posix.madvise(
         @constCast(@alignCast(buffer.ptr)),
         if (buffer.len <= 2 * madvise_size) buffer.len else 2 * madvise_size,
         std.posix.MADV.WILLNEED
-    );
-
-    var offset: usize = 0;
+    ) catch unreachable;
 
     var semicolon_bitmask_curr: @Int(.unsigned, read_veclen) = grabSemicolonBitmask(
         read_veclen, @alignCast(@ptrCast(buffer.ptr)));
     var vector_offset: usize = 0;
+    
+    if (buffer.ptr != assigned_buffer.ptr) {
+        // need to mask out possible semicolons that we weren't assigned
+        const all_ones = ~@as(@Int(.unsigned, read_veclen), 0);
+        semicolon_bitmask_curr &= all_ones << @intCast(assigned_buffer.ptr - buffer.ptr);
+        offset = assigned_buffer.ptr - buffer.ptr;
+    }
 
     while (offset < buffer.len) {
         while (semicolon_bitmask_curr == 0) {
@@ -143,15 +207,15 @@ inline fn extractValuesSafeOOB(
             const next_start = offset_floor + madvise_size;
             const next_end = @min(next_start + madvise_size, buffer.len);
             if (next_start < next_end) {
-                try std.posix.madvise(
+                std.posix.madvise(
                     @constCast(@alignCast(buffer.ptr + next_start)),
                     next_end - next_start,
                     std.posix.MADV.WILLNEED
-                );
+                ) catch unreachable;
             }
         }
 
-        try hash_table.update(name, value);
+        hash_table.update(name, value);
     }
 }
 
@@ -388,14 +452,14 @@ const HashTable = struct {
         allocator.free(self.data);
     }
 
-    fn update(self: *@This(), name: []const u8, temperature: i16) !void {
+    fn update(self: *@This(), name: []const u8, temperature: i16) void {
         const hash = xorHash(name);
         const metadata: Metadata = .fromHash(hash);
         var index: IndexInt = @intCast(hash % self.data.len);
 
         while (true) : (index +%= 1) {
             if (self.meta[index] == Metadata.empty()) {
-                const new_name = try self.name_allocator.alloc(u8, name.len);
+                const new_name = self.name_allocator.alloc(u8, name.len) catch unreachable;
                 @memcpy(new_name, name);
                 self.data[index].name = new_name;
                 
