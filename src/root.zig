@@ -15,21 +15,41 @@ const StationStats = struct {
 };
 
 const read_veclen = std.simd.suggestVectorLength(u8) orelse 8; // orelse must fall back to at least 6
-const madvise_size: usize = 64 * (1 << 20);
+const read_buffer_size = 1024 * 1024;
+const read_padding = @max(128, read_veclen);
+const max_line_length = max_station_name_length + ";-99.9\n".len;
 const num_workers = 8;
+
+const ProcessError = Io.File.ReadPositionalError || Io.ConcurrentError || error{
+    InvalidRecord,
+    UnexpectedEndOfFile,
+};
 
 const WorkerConfig = struct {
     io: Io,
     hashtable: HashTable,
     sorted_output_destination: []HashTable.Data,
-    parse_buffer: []const u8,
+    file: Io.File,
+    soft_start: u64,
+    soft_end: u64,
+    file_size: u64,
+    buffers: [2][]align(read_veclen) u8,
     _string_pool_allocator: *std.heap.FixedBufferAllocator,
 
-    fn init(io: Io, parse_buffer: []const u8, allocator: std.mem.Allocator) !@This() {
+    fn init(io: Io, soft_start: u64, soft_end: u64, file_size: u64, file: Io.File, allocator: std.mem.Allocator) !@This() {
         const string_pool = try allocator.alloc(u8, (max_unique_station_count + 1) * max_station_name_length);
+        errdefer allocator.free(string_pool);
         const string_pool_allocator = try allocator.create(std.heap.FixedBufferAllocator);
+        errdefer allocator.destroy(string_pool_allocator);
         string_pool_allocator.* = std.heap.FixedBufferAllocator.init(string_pool);
-        const hashtable = try HashTable.init(allocator, string_pool_allocator.allocator());
+        var hashtable = try HashTable.init(allocator, string_pool_allocator.allocator());
+        errdefer hashtable.deinit(allocator);
+
+        // allocate a little extra to guarantee reads potentially past their known slices
+        const a_buffer = try allocator.alignedAlloc(u8, .fromByteUnits(read_veclen), read_buffer_size + read_padding);
+        errdefer allocator.free(a_buffer);
+        const b_buffer = try allocator.alignedAlloc(u8, .fromByteUnits(read_veclen), read_buffer_size + read_padding);
+        errdefer allocator.free(b_buffer);
 
         const sorted_output_destination = try allocator.alloc(HashTable.Data, max_unique_station_count);
 
@@ -37,7 +57,11 @@ const WorkerConfig = struct {
             .io = io,
             .hashtable = hashtable,
             .sorted_output_destination = sorted_output_destination,
-            .parse_buffer = parse_buffer,
+            .file = file,
+            .soft_start = soft_start,
+            .soft_end = soft_end,
+            .file_size = file_size,
+            .buffers = .{ a_buffer, b_buffer },
             ._string_pool_allocator = string_pool_allocator,
         };
     }
@@ -46,10 +70,13 @@ const WorkerConfig = struct {
         self.hashtable.deinit(allocator);
         allocator.free(self._string_pool_allocator.buffer);
         allocator.destroy(self._string_pool_allocator);
+
         // reset because it will have been changed to reflect the actual count,
         // but must be freed at the originally allocated size
         self.sorted_output_destination.len = max_unique_station_count;
         allocator.free(self.sorted_output_destination);
+
+        for (self.buffers) |buffer| allocator.free(buffer);
     }
 };
 
@@ -67,58 +94,45 @@ pub fn printStats(
 
     const stats = try file.stat(io);
     const file_size = stats.size;
-    const good_size = blk: {
-        // values read a whole 64-bit int, but at minimum 4 of those bytes (x.x\n)
-        // are actually valid bits, so we only need to account for the overread
-        const max_value_overread = @sizeOf(u64) - 4;
-        const file_size_with_overread = file_size + max_value_overread;
-        const desired_to_be_multiple_of = stats.block_size;
-        const rounded_up = (file_size_with_overread + desired_to_be_multiple_of - 1) / desired_to_be_multiple_of * desired_to_be_multiple_of;
-        break :blk rounded_up;
-    };
-    const mmapped_buf = try std.posix.mmap(null, good_size, .{ .READ = true, .WRITE = false }, .{ .TYPE = .PRIVATE }, file.handle, 0);
-    defer std.posix.munmap(mmapped_buf);
 
     comptime assert(max_station_name_length <= 128);
 
-    // should be the index one past a newline
-    var split_points: [num_workers + 1]usize = undefined;
+    // Workers resolve these block-aligned soft boundaries to newlines themselves.
+    var split_points: [num_workers + 1]u64 = undefined;
     split_points[0] = 0;
     split_points[split_points.len - 1] = stats.size;
     for (split_points[1..num_workers], 1..) |*split_point, i| {
         const ideal = file_size / num_workers * i;
-        const floored_to_page = ideal - (ideal % std.heap.pageSize());
-        
-        std.posix.madvise(
-            @alignCast(mmapped_buf.ptr[floored_to_page..]),
-            max_station_name_length,
-            std.posix.MADV.WILLNEED
-        ) catch unreachable;
-
-        const line_end = std.mem.findScalarPos(u8, mmapped_buf, floored_to_page, '\n') orelse unreachable;
-        split_point.* = line_end + 1;
+        const block_size = @max(stats.block_size, 1);
+        const floored_to_block = ideal - (ideal % block_size);
+        split_point.* = floored_to_block;
     }
     
     var config: [num_workers]WorkerConfig = undefined;
+    var initialized: usize = 0;
+    defer {
+        for (config[0..initialized]) |*worker_config| worker_config.deinit(allocator);
+    }
     for (&config, 0..) |*worker_config, i| {
         worker_config.* = try WorkerConfig.init(
             io,
-            mmapped_buf[split_points[i]..split_points[i+1]],
+            split_points[i], split_points[i+1],
+            file_size,
+            file,
             allocator
         );
-    }
-    defer {
-        for (&config) |*worker_config| {
-            worker_config.deinit(allocator);
-        }
+        initialized += 1;
     }
 
-    var group: Io.Group = .init;
-    for (&config) |*worker_config| {
-        group.async(io, fullProcess, .{worker_config});
+    var workers: [num_workers]Io.Future(ProcessError!void) = undefined;
+    for (&config, &workers) |*worker_config, *worker| {
+        worker.* = io.async(fullProcess, .{worker_config});
     }
-
-    try group.await(io);
+    // Join every task before freeing its buffers, including on a worker's read error.
+    defer for (&workers) |*worker| {
+        worker.cancel(io) catch {};
+    };
+    for (&workers) |*worker| try worker.await(io);
     
     var wrapped: [num_workers][]HashTable.Data = undefined;
     for (&wrapped, 0..) |*wrapped_slice, i| {
@@ -128,10 +142,55 @@ pub fn printStats(
     try mergeAndPrintData(&wrapped, writer);
 }
 
-fn fullProcess(
-    config: *WorkerConfig,
-) void {
-    extractValuesSafeOOB(config.parse_buffer, &config.hashtable);
+fn readBuffer(config: *const WorkerConfig, buffer: []u8, prefix_len: usize, offset: u64) ProcessError!usize {
+    // Read far enough to finish the record at the soft end, without seeking backwards.
+    const read_end = @min(config.soft_end +| max_line_length, config.file_size);
+    const len: usize = @intCast(@min(read_buffer_size - prefix_len, read_end - offset));
+    const bytes_read = try config.file.readPositionalAll(config.io, buffer[prefix_len..][0..len], offset);
+    if (bytes_read != len) return error.UnexpectedEndOfFile;
+    const filled = prefix_len + len;
+    // SIMD name scans, hashing, and temperature loads intentionally overread.
+    @memset(buffer[filled..][0..read_padding], 0);
+    return filled;
+}
+
+fn fullProcess(config: *WorkerConfig) ProcessError!void {
+    if (config.soft_start != config.soft_end) {
+        var current: usize = 0;
+        var filled = try readBuffer(config, config.buffers[current], 0, config.soft_start);
+        var offset = config.soft_start + filled;
+        // The preceding worker owns the record containing a nonzero soft start.
+        var parse_start: usize = if (config.soft_start == 0) 0 else
+            (std.mem.findScalar(u8, config.buffers[current][0..filled], '\n') orelse return error.InvalidRecord) + 1;
+        while (true) {
+            const buffer = config.buffers[current];
+            const buffer_start = offset - filled;
+            if (offset > config.soft_end or offset == config.file_size) {
+                const parse_end = if (config.soft_end == config.file_size) blk: {
+                    if (buffer[filled - 1] != '\n') return error.UnexpectedEndOfFile;
+                    break :blk filled;
+                } else blk: {
+                    const boundary: usize = @intCast(config.soft_end - buffer_start);
+                    break :blk (std.mem.findScalarPos(u8, buffer[0..filled], boundary, '\n') orelse return error.UnexpectedEndOfFile) + 1;
+                };
+                if (parse_start < parse_end) extractValuesSafeOOB(buffer[parse_start..parse_end], &config.hashtable);
+                break;
+            }
+            const parse_end = (std.mem.findScalarLast(u8, buffer[0..filled], '\n') orelse return error.InvalidRecord) + 1;
+            const tail_len = filled - parse_end;
+            if (tail_len >= max_line_length) return error.InvalidRecord;
+
+            const next = current ^ 1;
+            // Carry the incomplete last record into the spare buffer before filling it.
+            @memcpy(config.buffers[next][0..tail_len], buffer[parse_end..filled]);
+            var pending = try config.io.concurrent(readBuffer, .{ config, config.buffers[next], tail_len, offset });
+            if (parse_start < parse_end) extractValuesSafeOOB(buffer[parse_start..parse_end], &config.hashtable);
+            filled = try pending.await(config.io);
+            offset += filled - tail_len;
+            current = next;
+            parse_start = 0;
+        }
+    }
 
     const total_count = config.hashtable.extractAll(config.sorted_output_destination);
     assert(total_count <= max_unique_station_count);
@@ -167,12 +226,6 @@ inline fn extractValuesSafeOOB(
         break :blk aligned_start[0..total_length];
     };
     
-    std.posix.madvise(
-        @constCast(@alignCast(buffer.ptr)),
-        if (buffer.len <= 2 * madvise_size) buffer.len else 2 * madvise_size,
-        std.posix.MADV.WILLNEED
-    ) catch unreachable;
-
     var semicolon_bitmask_curr: @Int(.unsigned, read_veclen) = grabSemicolonBitmask(
         read_veclen, @alignCast(@ptrCast(buffer.ptr)));
     var vector_offset: usize = 0;
@@ -192,28 +245,12 @@ inline fn extractValuesSafeOOB(
         const name: []const u8 = buffer[offset..vector_offset + @ctz(semicolon_bitmask_curr)];
         semicolon_bitmask_curr ^= @as(@Int(.unsigned, read_veclen), 1) << @intCast(@ctz(semicolon_bitmask_curr));
 
-        const prev_offset = offset;
-        
         offset += name.len + 1; // plus 1 for the ';'
 
         const result = extractValueSafeOOB(buffer[offset..]);
         const value = result.val;
         const char_count = result.char_count;
         offset += char_count;
-
-        const offset_floor = offset & ~(madvise_size - 1);
-        if (offset_floor != prev_offset & ~(madvise_size - 1)) {
-            // we crossed an madvise_size boundary, so need advise we'll need the next one
-            const next_start = offset_floor + madvise_size;
-            const next_end = @min(next_start + madvise_size, buffer.len);
-            if (next_start < next_end) {
-                std.posix.madvise(
-                    @constCast(@alignCast(buffer.ptr + next_start)),
-                    next_end - next_start,
-                    std.posix.MADV.WILLNEED
-                ) catch unreachable;
-            }
-        }
 
         hash_table.update(name, value);
     }
@@ -465,6 +502,7 @@ const HashTable = struct {
     fn init(allocator: std.mem.Allocator, name_allocator: std.mem.Allocator) !@This() {
         const len = std.math.maxInt(IndexInt) + 1;
         const meta = try allocator.alignedAlloc(Metadata, .fromByteUnits(@alignOf(ExtractVector)), len);
+        errdefer allocator.free(meta);
         @memset(meta, .empty());
         
         return .{
@@ -562,7 +600,7 @@ fn mergeAndPrintData(
         }
         assert(data[best_index].len > 0);
 
-        for (data[1..], 1..) |data_list, i| {
+        for (data[best_index + 1..], best_index + 1..) |data_list, i| {
             if (data_list.len == 0) continue;
             const cmp = stringCompareAssumingSafeOOB(data_list[0].name, data[best_index][0].name);
             if (cmp == .lt) {
