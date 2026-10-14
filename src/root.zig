@@ -149,8 +149,6 @@ fn readBuffer(config: *const WorkerConfig, buffer: []u8, prefix_len: usize, offs
     const bytes_read = try config.file.readPositionalAll(config.io, buffer[prefix_len..][0..len], offset);
     if (bytes_read != len) return error.UnexpectedEndOfFile;
     const filled = prefix_len + len;
-    // SIMD name scans, hashing, and temperature loads intentionally overread.
-    @memset(buffer[filled..][0..read_padding], 0);
     return filled;
 }
 
