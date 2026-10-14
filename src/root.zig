@@ -486,6 +486,7 @@ const HashTable = struct {
         stats: StationStats,
     };
     const IndexInt = u16;
+    const capacity = @as(usize, std.math.maxInt(IndexInt)) + 1;
     const ExtractVector = blk: {
         const MetadataBackingInt = @typeInfo(Metadata).@"struct".backing_integer orelse unreachable;
         const suggested_len = std.simd.suggestVectorLength(MetadataBackingInt) orelse 1;
@@ -498,7 +499,7 @@ const HashTable = struct {
     name_allocator: std.mem.Allocator,
 
     fn init(allocator: std.mem.Allocator, name_allocator: std.mem.Allocator) !@This() {
-        const len = std.math.maxInt(IndexInt) + 1;
+        const len = capacity;
         const meta = try allocator.alignedAlloc(Metadata, .fromByteUnits(@alignOf(ExtractVector)), len);
         errdefer allocator.free(meta);
         @memset(meta, .empty());
@@ -516,23 +517,16 @@ const HashTable = struct {
     }
 
     fn update(self: *@This(), name: []const u8, temperature: i16) void {
+        assert(self.data.len == capacity);
         const hash = xorHash(name);
         const metadata: Metadata = .fromHash(hash);
-        var index: IndexInt = @intCast(hash % self.data.len);
+        // The fixed capacity spans every IndexInt value, so truncation is modulo capacity.
+        var index: IndexInt = @truncate(hash);
 
         while (true) : (index +%= 1) {
             if (self.meta[index] == Metadata.empty()) {
-                const new_name = self.name_allocator.alloc(u8, name.len) catch unreachable;
-                @memcpy(new_name, name);
-                self.data[index].name = new_name;
-                
-                self.data[index].stats.count = 1;
-                self.data[index].stats.min = temperature;
-                self.data[index].stats.max = temperature;
-                self.data[index].stats.sum = temperature;
-
-                self.meta[index] = metadata;
-                return;
+                @branchHint(.unlikely);
+                return self.insert(index, metadata, name, temperature);
             }
             if (self.meta[index] != metadata) {
                 @branchHint(.unlikely); // number of hash collisions stays pretty low
@@ -543,15 +537,27 @@ const HashTable = struct {
             
             if (stringEqualAssumingSafeOOB(name, self.data[index].name)) {
                 @branchHint(.likely); // chances of collision are low, so very likely to be the same name
-                self.data[index].stats.count += 1;
-                self.data[index].stats.min = @min(self.data[index].stats.min, temperature);
-                self.data[index].stats.max = @max(self.data[index].stats.max, temperature);
-                self.data[index].stats.sum += temperature;
+                const stats = &self.data[index].stats;
+                stats.count += 1;
+                stats.min = @min(stats.min, temperature);
+                stats.max = @max(stats.max, temperature);
+                stats.sum += temperature;
                 return;
             }
         }
 
         unreachable;
+    }
+
+    // Keep allocation and copying out of the per-measurement update path.
+    noinline fn insert(self: *@This(), index: IndexInt, metadata: Metadata, name: []const u8, temperature: i16) void {
+        const new_name = self.name_allocator.alloc(u8, name.len) catch unreachable;
+        @memcpy(new_name, name);
+        self.data[index] = .{
+            .name = new_name,
+            .stats = .{ .count = 1, .min = temperature, .max = temperature, .sum = temperature },
+        };
+        self.meta[index] = metadata;
     }
 
     fn extractAll(self: *const @This(), dest: []Data) usize {
