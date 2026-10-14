@@ -581,46 +581,95 @@ const HashTable = struct {
     }
 };
 
+/// A min-heap of nonempty sorted streams, ordered by each stream's head.
+/// Reuses and consumes the caller's slice descriptors; the records stay unchanged.
+const MergeHeap = struct {
+    streams: [][]HashTable.Data,
+
+    fn init(data: [][]HashTable.Data) MergeHeap {
+        var active: usize = 0;
+        for (data) |stream| {
+            if (stream.len == 0) continue;
+            data[active] = stream;
+            active += 1;
+        }
+        @memset(data[active..], &.{});
+        var heap: MergeHeap = .{ .streams = data[0..active] };
+        // Bottom-up heap construction is O(k); no stream needs advancing yet.
+        var parent = active / 2;
+        while (parent > 0) {
+            parent -= 1;
+            heap.siftDown(parent);
+        }
+        return heap;
+    }
+
+    fn siftDown(self: *MergeHeap, start: usize) void {
+        const stream = self.streams[start];
+        var parent = start;
+        while (parent < self.streams.len / 2) {
+            var child = parent * 2 + 1;
+            const right = child + 1;
+            if (right < self.streams.len and
+                stringCompareAssumingSafeOOB(self.streams[right][0].name, self.streams[child][0].name) == .lt)
+            {
+                child = right;
+            }
+            if (stringCompareAssumingSafeOOB(stream[0].name, self.streams[child][0].name) != .gt) break;
+            self.streams[parent] = self.streams[child];
+            parent = child;
+        }
+        self.streams[parent] = stream;
+    }
+
+    fn pop(self: *MergeHeap) HashTable.Data {
+        const result = self.streams[0][0];
+        self.streams[0] = self.streams[0][1..];
+        if (self.streams[0].len == 0) {
+            const last = self.streams.len - 1;
+            self.streams[0] = self.streams[last];
+            self.streams[last] = &.{};
+            self.streams.len = last;
+        }
+        // Advancing a sorted stream can only increase its head. Replacing an
+        // exhausted root with the last stream likewise only needs a sift down.
+        if (self.streams.len != 0) self.siftDown(0);
+        return result;
+    }
+
+    fn next(self: *MergeHeap) ?HashTable.Data {
+        if (self.streams.len == 0) return null;
+        var result = self.pop();
+        // Equal names need not be adjacent in the heap, but each reaches the
+        // root before any larger name, so combine them before emitting a row.
+        while (self.streams.len != 0 and
+            stringCompareAssumingSafeOOB(result.name, self.streams[0][0].name) == .eq)
+        {
+            const other = self.pop().stats;
+            result.stats.min = @min(result.stats.min, other.min);
+            result.stats.max = @max(result.stats.max, other.max);
+            result.stats.sum += other.sum;
+            result.stats.count += other.count;
+        }
+        return result;
+    }
+};
+
 fn mergeAndPrintData(
     data: [][]HashTable.Data,
     writer: *Io.Writer
 ) !void {
-    assert(data.len > 0);
+    var heap = MergeHeap.init(data);
 
     try writer.print("{{", .{});
 
     var first_loop = true;
-    mainloop: while (true) {
-        var best_index: usize = 0;
-        while (data[best_index].len == 0) {
-            best_index += 1;
-            if (best_index == data.len) break :mainloop;
-        }
-        assert(data[best_index].len > 0);
-
-        for (data[best_index + 1..], best_index + 1..) |data_list, i| {
-            if (data_list.len == 0) continue;
-            const cmp = stringCompareAssumingSafeOOB(data_list[0].name, data[best_index][0].name);
-            if (cmp == .lt) {
-                best_index = i;
-            } else if (cmp == .eq) {
-                const stats_a = data[best_index][0].stats;
-                const stats_b = data[i][0].stats;
-                data[best_index][0].stats = .{
-                    .min = @min(stats_a.min, stats_b.min),
-                    .max = @max(stats_a.max, stats_b.max),
-                    .sum = stats_a.sum + stats_b.sum,
-                    .count = stats_a.count + stats_b.count,
-                };
-                data[i] = data[i][1..];
-            }
-        }
-
+    while (heap.next()) |entry| {
         if (!first_loop) try writer.print(", ", .{});
         first_loop = false;
 
-        try writer.print("{s}=", .{data[best_index][0].name});
-        const stats = data[best_index][0].stats;
+        try writer.print("{s}=", .{entry.name});
+        const stats = entry.stats;
         const average = blk: {
             const partial_result = @divFloor(stats.sum * 10, @as(i64, @intCast(stats.count)));
             break :blk @divFloor(partial_result + 5, 10);
@@ -632,8 +681,6 @@ fn mergeAndPrintData(
                 if (average < 0) "-" else "", @abs(@divTrunc(average, 10)), @abs(@rem(average, 10)),
                 if (stats.max < 0) "-" else "", @abs(@divTrunc(stats.max, 10)), @abs(@rem(stats.max, 10))}
         );
-
-        data[best_index] = data[best_index][1..];
     }
     try writer.print("}}\n", .{});
     try writer.flush();
