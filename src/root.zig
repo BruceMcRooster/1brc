@@ -550,7 +550,7 @@ const HashTable = struct {
     }
 
     // Keep allocation and copying out of the per-measurement update path.
-    noinline fn insert(self: *@This(), index: IndexInt, metadata: Metadata, name: []const u8, temperature: i16) void {
+    fn insert(self: *@This(), index: IndexInt, metadata: Metadata, name: []const u8, temperature: i16) void {
         const new_name = self.name_allocator.alloc(u8, name.len) catch unreachable;
         @memcpy(new_name, name);
         self.data[index] = .{
