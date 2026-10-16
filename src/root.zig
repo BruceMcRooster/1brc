@@ -241,7 +241,7 @@ inline fn extractValuesSafeOOB(
             semicolon_bitmask_curr = grabSemicolonBitmask(read_veclen, @alignCast(@ptrCast(buffer.ptr + vector_offset)));
         }
         const name: []const u8 = buffer[offset..vector_offset + @ctz(semicolon_bitmask_curr)];
-        semicolon_bitmask_curr ^= @as(@Int(.unsigned, read_veclen), 1) << @intCast(@ctz(semicolon_bitmask_curr));
+        semicolon_bitmask_curr &= semicolon_bitmask_curr - 1; // remove lowest set bit, one instruction on x86, 2 on arm
 
         offset += name.len + 1; // plus 1 for the ';'
 
